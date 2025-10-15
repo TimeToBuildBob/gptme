@@ -85,6 +85,36 @@ class TestAutoIncludeLessonsHook:
             "GPTME_LESSONS_AUTO_INCLUDE", True
         )
 
+    def test_hook_disabled_in_noninteractive_mode(
+        self, conversation_log, mock_config, sample_lesson, sample_match
+    ):
+        """Test hook can be disabled in non-interactive mode."""
+        # Setup: disable for non-interactive mode
+        mock_config.get_env.side_effect = (
+            lambda k, d=None: "disabled"
+            if k == "GPTME_LESSONS_NONINTERACTIVE_MODE"
+            else d
+        )
+        mock_config.get_env_bool.side_effect = (
+            lambda k, d=True: True if k == "GPTME_LESSONS_AUTO_INCLUDE" else d
+        )
+
+        with patch("gptme.tools.lessons.HAS_LESSONS", True):
+            with patch("gptme.tools.lessons.LessonIndex") as mock_index_class:
+                with patch("gptme.tools.lessons.LessonMatcher") as mock_matcher_class:
+                    mock_index = MagicMock()
+                    mock_index.lessons = [sample_lesson]
+                    mock_index_class.return_value = mock_index
+
+                    mock_matcher = MagicMock()
+                    mock_matcher.match.return_value = [sample_match]
+                    mock_matcher_class.return_value = mock_matcher
+
+                    messages = list(auto_include_lessons_hook(conversation_log))
+
+                    # Should return empty - disabled in non-interactive mode
+                    assert len(messages) == 0
+
     def test_hook_no_user_message(self, mock_config):
         """Test hook with no user messages."""
         log = [Message(role="system", content="System message")]
@@ -126,6 +156,16 @@ class TestAutoIncludeLessonsHook:
         self, conversation_log, mock_config, sample_lesson, sample_match
     ):
         """Test hook includes matching lessons."""
+        # Setup config mocks
+        mock_config.get_env.side_effect = (
+            lambda k, d=None: "enabled"
+            if k == "GPTME_LESSONS_NONINTERACTIVE_MODE"
+            else d
+        )
+        mock_config.get_env_bool.side_effect = (
+            lambda k, d=True: True if k == "GPTME_LESSONS_AUTO_INCLUDE" else d
+        )
+
         with patch("gptme.tools.lessons.HAS_LESSONS", True):
             with patch("gptme.tools.lessons.LessonIndex") as mock_index_class:
                 with patch("gptme.tools.lessons.LessonMatcher") as mock_matcher_class:
@@ -170,7 +210,11 @@ class TestAutoIncludeLessonsHook:
                 )
             )
 
-        mock_config.get_env.return_value = "3"  # Limit to 3
+        mock_config.get_env.side_effect = (
+            lambda k, d=None: "3"
+            if k == "GPTME_LESSONS_MAX_INCLUDED"
+            else ("enabled" if k == "GPTME_LESSONS_NONINTERACTIVE_MODE" else d)
+        )  # Limit to 3
 
         with patch("gptme.tools.lessons.HAS_LESSONS", True):
             with patch("gptme.tools.lessons.LessonIndex") as mock_index_class:

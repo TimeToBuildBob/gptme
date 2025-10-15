@@ -26,6 +26,37 @@ except ImportError:
     logger.warning("Lessons module not available")
 
 
+def _should_include_in_noninteractive() -> bool:
+    """Check if lessons should be auto-included in non-interactive mode.
+
+    Respects GPTME_LESSONS_NONINTERACTIVE_MODE environment variable:
+    - 'enabled': Always include in non-interactive mode
+    - 'disabled': Never include in non-interactive mode
+    - 'auto' (default): Auto-detect based on TTY (include if interactive)
+
+    Returns:
+        bool: True if lessons should be included, False otherwise
+    """
+    import sys
+
+    config = get_config()
+    mode = (config.get_env("GPTME_LESSONS_NONINTERACTIVE_MODE") or "auto").lower()
+
+    if mode == "enabled":
+        return True
+    elif mode == "disabled":
+        return False
+    elif mode == "auto":
+        # Auto-detect: include if stdin is a TTY (interactive terminal)
+        return sys.stdin.isatty()
+    else:
+        logger.warning(
+            f"Invalid GPTME_LESSONS_NONINTERACTIVE_MODE value: {mode}. "
+            "Using 'auto' mode."
+        )
+        return sys.stdin.isatty()
+
+
 def auto_include_lessons_hook(
     log: list[Message],
     **kwargs,
@@ -37,6 +68,11 @@ def auto_include_lessons_hook(
     # Check if auto-include is enabled via environment variable
     config = get_config()
     if not config.get_env_bool("GPTME_LESSONS_AUTO_INCLUDE", True):
+        return
+
+    # Check non-interactive mode configuration
+    if not _should_include_in_noninteractive():
+        logger.debug("Lesson auto-inclusion disabled in non-interactive mode")
         return
 
     # Get max lessons from environment or use default
@@ -149,6 +185,14 @@ Lesson content...
 ```
 
 Lessons are automatically included when their keywords match the conversation context.
+
+Configuration (via environment variables):
+- GPTME_LESSONS_AUTO_INCLUDE: Enable/disable auto-inclusion (default: true)
+- GPTME_LESSONS_MAX_INCLUDED: Maximum number of lessons to include (default: 5)
+- GPTME_LESSONS_NONINTERACTIVE_MODE: Control behavior in non-interactive mode
+  - 'enabled': Always auto-include in non-interactive mode
+  - 'disabled': Never auto-include in non-interactive mode
+  - 'auto' (default): Auto-detect based on TTY (include if interactive terminal)
 """.strip(),
     available=HAS_LESSONS,
     hooks={
