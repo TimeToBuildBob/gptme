@@ -101,6 +101,7 @@ extensions = [
 # Intersphinx mapping for cross-references to Python standard library
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
+    "pydantic": ("https://docs.pydantic.dev/latest/", None),
 }
 
 html_baseurl = "https://gptme.org/docs/"  # used to build sitemap
