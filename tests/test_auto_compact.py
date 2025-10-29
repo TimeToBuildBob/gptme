@@ -2,6 +2,7 @@
 Tests for auto-compacting functionality that handles conversations with massive tool results.
 """
 
+import time
 from datetime import datetime
 
 import pytest
@@ -162,94 +163,92 @@ def test_auto_compact_preserves_pinned_messages():
 
 
 def test_get_compacted_name_no_suffix():
-    """Test backup name generation for conversation without existing suffix."""
+    """Test compacted name generation for conversation without existing suffix."""
     import re
 
     name = _get_compacted_name("2025-10-13-flying-yellow-alien")
-    # Should match: base-name-before-compact-XXXX where XXXX is 4 hex chars
-    assert re.match(
-        r"^2025-10-13-flying-yellow-alien-before-compact-[0-9a-f]{4}$", name
-    )
+    # Should match: base-name-before-compact-XXXX where XXXX is timestamp suffix YYYYMMDD-HHMMSS
+    assert re.match(r"^2025-10-13-flying-yellow-alien-compacted-\d{8}-\d{6}$", name)
 
 
 def test_get_compacted_name_one_suffix():
-    """Test backup name generation when suffix already exists (gets new unique suffix)."""
-    import re
-
-    name = _get_compacted_name("2025-10-13-flying-yellow-alien-before-compact")
-    # Should strip old suffix and add new one with random suffix
-    assert re.match(
-        r"^2025-10-13-flying-yellow-alien-before-compact-[0-9a-f]{4}$", name
-    )
-
-
-def test_get_compacted_name_multiple_suffixes():
-    """Test backup name generation with multiple accumulated suffixes (should strip all)."""
+    """Test compacted name generation when suffix already exists (gets new unique suffix)."""
     import re
 
     name = _get_compacted_name(
-        "2025-10-13-flying-yellow-alien-before-compact-before-compact-before-compact"
+        "2025-10-13-flying-yellow-alien-compacted-20251029-100000"
     )
-    assert re.match(
-        r"^2025-10-13-flying-yellow-alien-before-compact-[0-9a-f]{4}$", name
+    # Should strip old suffix and add new one with timestamp
+    assert re.match(r"^2025-10-13-flying-yellow-alien-compacted-\d{8}-\d{6}$", name)
+
+
+def test_get_compacted_name_multiple_suffixes():
+    """Test compacted name generation with multiple accumulated suffixes (should strip all)."""
+    import re
+
+    name = _get_compacted_name(
+        "2025-10-13-flying-yellow-alien-compacted-20251028-120000-compacted-20251029-090000"
     )
+    assert re.match(r"^2025-10-13-flying-yellow-alien-compacted-\d{8}-\d{6}$", name)
 
 
 def test_get_compacted_name_edge_cases():
-    """Test backup name generation with various edge cases."""
+    """Test compacted name generation with various edge cases."""
     import re
 
     # Short name
     name = _get_compacted_name("conv")
-    assert re.match(r"^conv-before-compact-[0-9a-f]{4}$", name)
+    assert re.match(r"^conv-compacted-\d{8}-\d{6}$", name)
 
     # Name containing 'compact' but not as suffix
     name = _get_compacted_name("compact-test")
-    assert re.match(r"^compact-test-before-compact-[0-9a-f]{4}$", name)
+    assert re.match(r"^compact-test-compacted-\d{8}-\d{6}$", name)
 
     # Name ending with similar but different suffix
     name = _get_compacted_name("test-before-compaction")
-    assert re.match(r"^test-before-compaction-before-compact-[0-9a-f]{4}$", name)
+    assert re.match(r"^test-before-compaction-compacted-\d{8}-\d{6}$", name)
 
 
 def test_get_compacted_name_uniqueness():
-    """Test that multiple calls produce unique backup names."""
+    """Test that multiple calls produce unique compacted names."""
     name1 = _get_compacted_name("my-conversation")
+    time.sleep(1.1)  # Ensure unique timestamps (second-level resolution)
     name2 = _get_compacted_name("my-conversation")
+    time.sleep(1.1)
     name3 = _get_compacted_name("my-conversation")
 
-    # All should have the same base but different random suffixes
+    # All should have the same base but different timestampes
     assert name1 != name2
     assert name2 != name3
     assert name1 != name3
 
     # All should start with the same base
-    assert name1.startswith("my-conversation-before-compact-")
-    assert name2.startswith("my-conversation-before-compact-")
-    assert name3.startswith("my-conversation-before-compact-")
+    assert name1.startswith("my-conversation-compacted-")
+    assert name2.startswith("my-conversation-compacted-")
+    assert name3.startswith("my-conversation-compacted-")
 
 
 def test_get_compacted_name_with_hex_suffix():
-    """Test that backup names with hex suffixes are correctly stripped.
+    """Test that compacted names with timestamp suffixes are correctly stripped.
 
     This is a regression test for the bug where:
-    "my-conversation-before-compact-a7c9" would become
-    "my-conversation-before-compact-a7c9-before-compact-k2p5"
+    "my-conversation-compacted-20251028-120000" would become
+    "my-conversation-compacted-20251028-120000-compacted-20251029-100000"
     instead of
-    "my-conversation-before-compact-k2p5"
+    "my-conversation-compacted-20251029-100000"
     """
     import re
 
-    # Test with a backup that has a valid hex suffix (only 0-9a-f)
-    name = _get_compacted_name("my-conversation-before-compact-a7c9")
+    # Test with a compacted name that has a valid timestamp suffix
+    name = _get_compacted_name("my-conversation-compacted-20251028-120000")
     # Should strip the old suffix and add a new one
-    assert re.match(r"^my-conversation-before-compact-[0-9a-f]{4}$", name)
-    # Should NOT contain the old hex suffix
-    assert "a7c9" not in name
+    assert re.match(r"^my-conversation-compacted-\d{8}-\d{6}$", name)
+    # Should NOT contain the old timestamp
+    assert "20251028-120000" not in name
 
 
 def test_get_compacted_name_empty_string():
-    """Test backup name generation with empty string raises ValueError."""
+    """Test compacted name generation with empty string raises ValueError."""
     with pytest.raises(ValueError, match="conversation name cannot be empty"):
         _get_compacted_name("")
 
