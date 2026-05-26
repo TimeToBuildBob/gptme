@@ -220,17 +220,17 @@ class TestOutputFormatValidation:
 class TestJSONRuntimeSuppression:
     """Runtime output in JSON mode must stay off the human-readable stdout rail."""
 
-    def test_init_model_suppresses_model_banner_in_json_mode(self, monkeypatch, capsys):
+    def test_init_model_suppresses_model_banner_in_json_mode(self, monkeypatch, capfd):
         set_output_format("json")
         monkeypatch.setattr(gptme_init, "init_llm", lambda _provider: None)
         monkeypatch.setattr(gptme_init, "set_default_model", lambda _model: None)
 
         gptme_init.init_model("openai/gpt-4o-mini", interactive=False)
 
-        captured = capsys.readouterr()
+        captured = capfd.readouterr()
         assert captured.out == ""
 
-    def test_guess_provider_suppresses_banner_in_json_mode(self, monkeypatch, capsys):
+    def test_guess_provider_suppresses_banner_in_json_mode(self, monkeypatch, capfd):
         set_output_format("json")
         monkeypatch.setattr(
             llm,
@@ -240,13 +240,11 @@ class TestJSONRuntimeSuppression:
 
         provider = llm.guess_provider_from_config()
 
-        captured = capsys.readouterr()
+        captured = capfd.readouterr()
         assert provider == "openai"
         assert captured.out == ""
 
-    def test_streaming_reply_suppresses_progress_in_json_mode(
-        self, monkeypatch, capsys
-    ):
+    def test_streaming_reply_suppresses_progress_in_json_mode(self, monkeypatch, capfd):
         set_output_format("json")
 
         def fake_stream():
@@ -269,13 +267,11 @@ class TestJSONRuntimeSuppression:
             agent_name="bob",
         )
 
-        captured = capsys.readouterr()
+        captured = capfd.readouterr()
         assert msg.content == "OK"
         assert captured.out == ""
 
-    def test_nonstream_reply_suppresses_progress_in_json_mode(
-        self, monkeypatch, capsys
-    ):
+    def test_nonstream_reply_suppresses_progress_in_json_mode(self, monkeypatch, capfd):
         set_output_format("json")
         monkeypatch.setattr(llm, "init_llm", lambda _provider: None)
         monkeypatch.setattr(
@@ -291,7 +287,7 @@ class TestJSONRuntimeSuppression:
             stream=False,
         )
 
-        captured = capsys.readouterr()
+        captured = capfd.readouterr()
         assert msg.content == "OK"
         assert captured.out == ""
 
