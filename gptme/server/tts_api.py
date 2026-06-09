@@ -68,8 +68,8 @@ def synthesize_speech():
     text = (raw_text or "").strip()
     if not text:
         return {"error": "text is required"}, 400
-    if len(text) > 1000:
-        return {"error": "text too long (max 1000 characters)"}, 400
+    if len(text) > 5000:
+        return {"error": "text too long (max 5000 characters)"}, 400
 
     from ..config import get_config
 

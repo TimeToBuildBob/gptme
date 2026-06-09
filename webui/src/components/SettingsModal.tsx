@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Separator } from '@/components/ui/separator';
 import {
   Settings,
@@ -239,8 +240,8 @@ export const SettingsModal = forwardRef<HTMLButtonElement, SettingsModalProps>(
                     Read responses aloud
                   </Label>
                   <p className="text-xs text-muted-foreground">
-                    Speak assistant messages aloud (uses gptme-tts server if configured, otherwise
-                    browser Web Speech API)
+                    Speak assistant messages aloud using the gptme server, gptme-tts server, or
+                    browser Web Speech API
                   </p>
                 </div>
                 <Switch
@@ -250,6 +251,38 @@ export const SettingsModal = forwardRef<HTMLButtonElement, SettingsModalProps>(
                   onCheckedChange={(checked) => updateSettings({ ttsEnabled: checked })}
                 />
               </div>
+
+              {settings.ttsEnabled && (
+                <div className="space-y-3 rounded-lg border p-3">
+                  <Label className="text-sm font-medium">TTS backend</Label>
+                  <RadioGroup
+                    value={settings.ttsBackend}
+                    onValueChange={(value: 'auto' | 'browser' | 'server') =>
+                      updateSettings({ ttsBackend: value })
+                    }
+                    className="space-y-2"
+                  >
+                    <div className="flex items-center space-x-2">
+                      <RadioGroupItem value="auto" id="tts-backend-auto" />
+                      <Label htmlFor="tts-backend-auto" className="text-sm font-normal">
+                        Auto (try server, fall back to browser)
+                      </Label>
+                    </div>
+                    <div className="flex items-center space-x-2">
+                      <RadioGroupItem value="browser" id="tts-backend-browser" />
+                      <Label htmlFor="tts-backend-browser" className="text-sm font-normal">
+                        Browser (Web Speech API)
+                      </Label>
+                    </div>
+                    <div className="flex items-center space-x-2">
+                      <RadioGroupItem value="server" id="tts-backend-server" />
+                      <Label htmlFor="tts-backend-server" className="text-sm font-normal">
+                        Server (gptme server or gptme-tts)
+                      </Label>
+                    </div>
+                  </RadioGroup>
+                </div>
+              )}
 
               <div className="space-y-2">
                 <Label htmlFor="tts-server-url" className="text-sm">

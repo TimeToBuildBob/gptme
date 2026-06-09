@@ -17,6 +17,13 @@ export interface Settings {
    */
   ttsServerUrl: string;
   /**
+   * TTS backend preference. Controls which speech path to use:
+   * - 'auto': try server endpoint first, fall back to browser (default)
+   * - 'browser': use Web Speech API only
+   * - 'server': use gptme server endpoint (or external gptme-tts server)
+   */
+  ttsBackend: 'auto' | 'browser' | 'server';
+  /**
    * WebSocket URL for the gptme-voice-server /voice endpoint, e.g. ws://localhost:5700/voice.
    * Leave empty to hide the VoiceButton.
    */
@@ -38,6 +45,7 @@ const defaultSettings: Settings = {
   hasCompletedSetup: false,
   welcomeBackground: '',
   ttsServerUrl: '',
+  ttsBackend: 'auto',
   voiceServerUrl: '',
 };
 

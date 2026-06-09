@@ -2,10 +2,10 @@
  * Text-to-speech via the browser's Web Speech API, the gptme server's
  * built-in /api/v2/audio/speech endpoint, or an external gptme-tts server.
  *
- * Priority:
- *   1. POST /api/v2/audio/speech (same-origin, uses OpenRouter via gptme server config).
- *   2. If `ttsServerUrl` is configured, GET {url}/tts?text=... and play the WAV.
- *   3. Fall back to the browser's built-in speechSynthesis API.
+ * Backend selection (controlled by the `ttsBackend` setting):
+ *   - 'auto': try server endpoint first, fall back to browser (default)
+ *   - 'browser': use Web Speech API only
+ *   - 'server': use gptme server endpoint (or external gptme-tts server)
  *
  * All paths strip markdown before speaking so output sounds natural.
  */
@@ -14,20 +14,24 @@ let currentAudio: HTMLAudioElement | null = null;
 let currentFetchController: AbortController | null = null;
 const LOCAL_TTS_NOT_CONFIGURED = 'tts-local-not-configured';
 
-function getSettings(): { ttsEnabled: boolean; ttsServerUrl: string } {
+type TtsBackend = 'auto' | 'browser' | 'server';
+
+function getSettings(): { ttsEnabled: boolean; ttsServerUrl: string; ttsBackend: TtsBackend } {
   try {
     const saved = localStorage.getItem('gptme-settings');
     if (saved) {
       const s = JSON.parse(saved);
+      const backend = s.ttsBackend as string;
       return {
         ttsEnabled: s.ttsEnabled === true,
         ttsServerUrl: typeof s.ttsServerUrl === 'string' ? s.ttsServerUrl.trim() : '',
+        ttsBackend: backend === 'browser' || backend === 'server' ? backend : 'auto',
       };
     }
   } catch {
     // ignore
   }
-  return { ttsEnabled: false, ttsServerUrl: '' };
+  return { ttsEnabled: false, ttsServerUrl: '', ttsBackend: 'auto' };
 }
 
 /** Strip markdown so the spoken text sounds natural. */
@@ -151,6 +155,19 @@ async function speak(rawText: string): Promise<void> {
 
   stopSpeaking();
 
+  const { ttsBackend, ttsServerUrl } = getSettings();
+
+  if (ttsBackend === 'browser') {
+    // Browser-only mode: use Web Speech API directly, skip server endpoints.
+    if (!window.speechSynthesis) return;
+    const utterance = new SpeechSynthesisUtterance(spoken);
+    utterance.rate = 1.1;
+    window.speechSynthesis.speak(utterance);
+    return;
+  }
+
+  // Server mode ('server') or auto mode ('auto'): try server endpoints first.
+
   // 1. Try the same-origin /api/v2/audio/speech endpoint first.
   try {
     await speakViaLocalEndpoint(spoken);
@@ -163,7 +180,6 @@ async function speak(rawText: string): Promise<void> {
   }
 
   // 2. Try an external gptme-tts server if configured.
-  const { ttsServerUrl } = getSettings();
   if (ttsServerUrl) {
     try {
       await speakViaExternalServer(spoken, ttsServerUrl);
@@ -174,7 +190,13 @@ async function speak(rawText: string): Promise<void> {
     }
   }
 
-  // 3. Fall back to the browser's built-in speechSynthesis.
+  // In 'server' mode, if no server endpoint succeeded, bail out with a warning.
+  if (ttsBackend === 'server') {
+    console.warn('TTS server backend selected but no server endpoint available.');
+    return;
+  }
+
+  // 3. Auto fall back to the browser's built-in speechSynthesis.
   if (!window.speechSynthesis) return;
   const utterance = new SpeechSynthesisUtterance(spoken);
   utterance.rate = 1.1;
