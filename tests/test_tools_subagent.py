@@ -679,6 +679,8 @@ def test_subprocess_command_includes_required_flags():
             assert any("--name=" in str(arg) for arg in cmd)
             assert "--model" in cmd
             assert "test-model" in cmd
+            assert "--tools" in cmd
+            assert cmd[cmd.index("--tools") + 1] == "+clarify"
             assert "Test task" not in cmd  # Prompt passed via stdin, not argv
 
         finally:
@@ -688,6 +690,44 @@ def test_subprocess_command_includes_required_flags():
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+
+
+def test_subprocess_profile_preserves_profile_tools_and_adds_clarify():
+    """Restricted subprocess profiles must keep their allowlist and add clarify."""
+    import tempfile
+    from pathlib import Path
+
+    from gptme.tools.subagent.execution import _run_subagent_subprocess
+
+    captured_cmd: list[str] = []
+
+    def fake_popen(cmd, **kwargs):
+        captured_cmd.clear()
+        captured_cmd.extend(cmd)
+        mock = MagicMock()
+        mock.poll.return_value = None
+        mock.args = cmd
+        return mock
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logdir = Path(tmpdir) / "logs"
+        logdir.mkdir()
+
+        with patch("gptme.tools.subagent.execution.subprocess.Popen", fake_popen):
+            _run_subagent_subprocess(
+                prompt="Explore task",
+                logdir=logdir,
+                model=None,
+                workspace=Path(tmpdir),
+                profile="explorer",
+            )
+
+    assert "--agent-profile" in captured_cmd
+    assert captured_cmd[captured_cmd.index("--agent-profile") + 1] == "explorer"
+    assert "--tools" in captured_cmd
+    assert captured_cmd[captured_cmd.index("--tools") + 1] == (
+        "read,chats,complete,clarify"
+    )
 
 
 @pytest.mark.slow
@@ -1195,6 +1235,7 @@ def test_profile_hard_tool_enforcement():
         ToolSpec(name="save", desc="Save files", instructions=""),
         ToolSpec(name="chats", desc="Chat management", instructions=""),
         ToolSpec(name="complete", desc="Signal completion", instructions=""),
+        ToolSpec(name="clarify", desc="Ask parent for clarification", instructions=""),
     ]
 
     # Track calls to set_tools
@@ -1233,10 +1274,11 @@ def test_profile_hard_tool_enforcement():
     assert len(set_tools_calls) == 1, f"set_tools called {len(set_tools_calls)} times"
     enforced_tools = set_tools_calls[0]
 
-    # Explorer profile allows: read, chats (+ complete always included)
+    # Explorer profile allows: read, chats (+ completion/clarification tools)
     assert "read" in enforced_tools
     assert "chats" in enforced_tools
     assert "complete" in enforced_tools
+    assert "clarify" in enforced_tools
     assert "shell" not in enforced_tools, "shell should be blocked by explorer profile"
     assert "save" not in enforced_tools, "save should be blocked by explorer profile"
 
