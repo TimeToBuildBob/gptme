@@ -582,6 +582,7 @@ def _run_planner(
     redact_secrets: bool = True,
     context_window: int | None = None,
     workdir: Path | None = None,
+    max_time: float | None = None,
 ) -> None:
     """Run a planner that delegates work to multiple executor subagents.
 
@@ -776,6 +777,14 @@ def _run_planner(
             with _subagents_lock:
                 _subagents.append(sa)
             monitor_t.start()
+            if max_time is not None:
+                from .api import _timeout_subagent  # deferred: avoids circular import
+
+                _timer = threading.Timer(
+                    max_time, _timeout_subagent, args=(executor_id, max_time)
+                )
+                _timer.daemon = True
+                _timer.start()
 
             # Sequential mode: wait for this executor before starting the next
             if execution_mode == "sequential":
@@ -860,6 +869,14 @@ def _run_planner(
             with _subagents_lock:
                 _subagents.append(sa)
             t.start()
+            if max_time is not None:
+                from .api import _timeout_subagent  # deferred: avoids circular import
+
+                _timer = threading.Timer(
+                    max_time, _timeout_subagent, args=(executor_id, max_time)
+                )
+                _timer.daemon = True
+                _timer.start()
 
             # Sequential mode: wait for each task to complete before starting next
             if execution_mode == "sequential":

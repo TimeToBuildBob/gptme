@@ -274,6 +274,7 @@ def subagent(
             redact_secrets=redact_secrets,
             context_window=context_window,
             workdir=workdir_path,
+            max_time=max_time,
         )
 
     # Validate context_mode parameters
@@ -865,6 +866,7 @@ def subagent_reply(agent_id: str, reply: str) -> None:
             role=sa.role,
             redact_secrets=sa.redact_secrets,
             context_window=sa.context_window,
+            max_time=sa.max_time,
         )
     except Exception:
         with _subagents_lock:
