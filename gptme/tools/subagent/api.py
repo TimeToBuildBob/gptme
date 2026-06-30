@@ -156,6 +156,15 @@ def subagent(
             Use this for defensive orchestration (prevent a stuck subagent from
             blocking the parent) or hard time budgets in autonomous sessions.
             ``max_time=None`` is fully backwards-compatible — no change in behavior.
+
+            **Mode-specific behaviour**: subprocess-mode subagents are SIGTERM/SIGKILL'd
+            on timeout (hard stop). Thread-mode subagents are marked timed-out and the
+            parent is notified, but the thread runs until its next cooperative checkpoint.
+            ACP-mode subagents receive the timeout notification immediately, but the
+            underlying ACP client thread blocks until the remote server responds — the
+            daemon thread will not outlive the process, but it cannot be interrupted
+            mid-request. A cooperative cancellation mechanism for ACP is a known
+            follow-up (out of scope for this patch).
         workdir: Working directory for the subagent. Defaults to the current
             working directory (``Path.cwd()``) when ``None``.
 
