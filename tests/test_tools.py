@@ -599,6 +599,10 @@ def test_get_toolchain_nonstrict_skips_unavailable():
         available.remove(unavailable_tool)
 
 
+@pytest.mark.skipif(
+    getattr(sys.flags, "nogil", False),
+    reason="threading.Thread inherits parent ContextVar state on free-threaded Python (3.13t); test only verifies GIL-enabled isolation",
+)
 def test_plain_thread_subagent_cannot_clobber_parent_tool_list():
     """Regression guard for the #554 "transient non-runnable" root cause.
 
