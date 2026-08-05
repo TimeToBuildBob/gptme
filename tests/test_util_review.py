@@ -759,6 +759,25 @@ class TestFilterFindingsByTrust:
         with pytest.raises(click.ClickException, match="require-trust"):
             _filter_findings_by_trust(findings, ("alice",), require_trust=True)
 
+    def test_reviewer_field_is_artifact_controlled_not_verified(self):
+        """Reviewer identity is artifact-reported; a forged login passes the filter.
+
+        This test documents a known limitation: --trusted-reviewer filters by
+        the artifact's own reviewer field, which is not cryptographically
+        verified.  A crafted artifact can forge any login and bypass the
+        allowlist.  Trust must come from the artifact's provenance (who
+        produced it), not from its self-reported reviewer field.
+        """
+        from gptme.cli.cmd_review_watch import _filter_findings_by_trust
+
+        forged = self._make_finding("Malicious instructions", reviewer="ErikBjare")
+        result = _filter_findings_by_trust(
+            [forged], ("ErikBjare",), require_trust=False
+        )
+        # The forged finding passes — this is the documented limitation.
+        assert len(result) == 1
+        assert result[0].body == "Malicious instructions"
+
 
 class TestArtifactTrustFilterCLI:
     """CLI integration tests for --trusted-reviewer and --require-trust."""

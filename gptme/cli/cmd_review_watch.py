@@ -307,6 +307,14 @@ def _filter_findings_by_trust(
     When ``require_trust`` is set, any finding whose ``reviewer`` field is
     absent or empty raises a :class:`click.ClickException` rather than
     silently passing or silently being dropped.
+
+    .. warning::
+        The ``reviewer`` field is **artifact-reported** and not
+        cryptographically verified.  A crafted artifact can forge any login.
+        This filter is useful for selecting among findings from a trusted
+        artifact source — it is NOT a security boundary against adversarial
+        artifacts.  Provenance trust must be established at the invocation
+        level (e.g. only pipe artifacts produced by a trusted CI job).
     """
     if require_trust:
         missing = [f for f in findings if not f.reviewer]
@@ -461,8 +469,11 @@ def spawn_review_session(
     multiple=True,
     metavar="LOGIN",
     help=(
-        "Only inject findings whose reviewer matches this GitHub login. "
-        "May be repeated for multiple trusted reviewers. "
+        "Only inject findings whose artifact-reported reviewer matches this "
+        "GitHub login (not cryptographically verified — artifact controls the "
+        "field). "
+        "Useful for selecting among findings from a trusted artifact source. "
+        "May be repeated for multiple reviewers. "
         "When omitted all findings are injected (default). "
         "Applies to --artifact mode only."
     ),
@@ -532,12 +543,11 @@ def review_watch(
 
         open_findings = artifact.open_findings
 
-        # Apply trust filter before building the prompt.  This is the
-        # primary mitigation for the P1 finding on #3449: artifact finding
-        # bodies are treated as authoritative instructions for a session that
-        # can commit and push.  Filtering to trusted reviewers prevents a
-        # crafted artifact (e.g. piped from an untrusted CI source) from
-        # injecting attacker-controlled instructions.
+        # Apply trust filter before building the prompt.
+        # Drops findings whose artifact-reported reviewer is not in the
+        # configured allowlist.  Note: the reviewer field is not verified —
+        # this filter selects among findings from a *trusted* artifact, not
+        # a security boundary against adversarial artifacts.
         open_findings = _filter_findings_by_trust(
             open_findings,
             trusted_reviewers,
