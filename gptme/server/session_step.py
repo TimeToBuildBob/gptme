@@ -659,6 +659,17 @@ def step(
         stream: Whether to stream the response (default: True)
     """
 
+    # A reserved continuation can be interrupted after its worker starts but
+    # before it reaches step(). Bail out before hooks, log writes, or lifecycle
+    # events make an aborted generation observable.
+    if not session.generating:
+        logger.debug(
+            "step(): aborting setup — session %s was interrupted",
+            session.id,
+        )
+        session.generating_since = None
+        return
+
     # Load chat config and prepare execution environment
     logdir = get_logs_dir() / conversation_id
     chat_config = ChatConfig.load_or_create(logdir, ChatConfig())
@@ -807,20 +818,6 @@ def step(
                 },
             )
             sse_token_batch.clear()
-
-        # Defence-in-depth: if the session was interrupted between the time
-        # _start_step_thread was called and now (e.g. because the caller used
-        # reserved=True and skipped the lock-and-check), bail out without
-        # starting an LLM API call.  This prevents a spurious API call and the
-        # resulting "[INTERRUPTED]" assistant message when an interrupt races
-        # with execute_tool_thread's auto-step dispatch.
-        if not session.generating:
-            logger.debug(
-                "step(): aborting before LLM call — session %s was interrupted",
-                session.id,
-            )
-            session.generating_since = None
-            return
 
         if stream:
             stream_wrapper = _stream(
@@ -1202,14 +1199,10 @@ def start_tool_execution(
             # With multiple tools per message, we must wait until every tool
             # has run before asking the model for a continuation.
             if not session.pending_tools:
-                # Guard against the interrupt-races-tool-completion scenario:
-                # if the user interrupted while this thread was executing the
-                # tool, the interrupt handler cleared session.generating (and
-                # pending_tools).  With reserved=True, _start_step_thread
-                # skips the lock-and-check (it trusts the caller to hold the
-                # reservation), so we must verify the flag here.  Without this
-                # guard a spurious LLM API call fires and an "[INTERRUPTED]"
-                # assistant message is appended even after the interrupt.
+                # Reserved workers inherit an existing generation reservation;
+                # an interrupt invalidates it. Unreserved workers must atomically
+                # acquire a new reservation because step() clears generating
+                # after launching the tool worker.
                 if reserved and not session.generating:
                     logger.debug(
                         "Not starting continuation step for %s: session was "

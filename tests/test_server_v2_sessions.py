@@ -1472,10 +1472,60 @@ class TestInterruptToolExecutionRace:
     "[INTERRUPTED]" message and waste an API call).
     """
 
-    def test_no_continuation_step_when_interrupted_during_tool_execution(
+    def test_no_continuation_side_effects_when_reserved_step_is_interrupted(
         self, conv, client: FlaskClient
     ):
-        """execute_tool_thread must not start an LLM step when generating was cleared."""
+        """An interrupted reserved step exits before hooks, events, or LLM calls."""
+        import threading
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from gptme.server.session_step import step
+
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+        session.generating = True
+
+        # Simulate the narrow race after _start_step_thread has spawned the
+        # worker but before step() starts running.
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+
+        def delayed_step() -> None:
+            worker_started.set()
+            release_worker.wait(timeout=5)
+            step(
+                conversation_id=conv["conversation_id"],
+                session=session,
+                model="mock/model",
+                workspace=Path("/tmp"),
+            )
+
+        with (
+            patch("gptme.server.session_step.ChatConfig.load_or_create") as config,
+            patch("gptme.server.session_step.trigger_hook") as trigger_hook,
+            patch("gptme.server.session_step.SessionManager.add_event") as add_event,
+            patch("gptme.server.session_step._stream") as stream,
+        ):
+            worker = threading.Thread(target=delayed_step)
+            worker.start()
+            assert worker_started.wait(timeout=5)
+            session.generating = False
+            session.generating_since = None
+            release_worker.set()
+            worker.join(timeout=5)
+
+        assert not worker.is_alive()
+
+        config.assert_not_called()
+        trigger_hook.assert_not_called()
+        add_event.assert_not_called()
+        stream.assert_not_called()
+
+    def test_reserved_tool_completion_does_not_dispatch_after_interrupt(
+        self, conv, client: FlaskClient
+    ):
+        """An interrupted pre-reserved worker must not dispatch a step thread."""
         import threading
         from pathlib import Path
         from unittest.mock import patch
@@ -1485,36 +1535,25 @@ class TestInterruptToolExecutionRace:
 
         session = SessionManager.get_session(conv["session_id"])
         assert session is not None
-
-        # Pre-register the tool — execute_tool_thread will pop() it.
         tool_id = "test-interrupt-race-tool"
-        tooluse = ToolUse("shell", [], "echo hi")
-        tool_exec = ToolExecution(tool_id=tool_id, tooluse=tooluse)
-        session.pending_tools[tool_id] = tool_exec
-
-        # Pre-reserve generation exactly as the rerun/step routes do.
+        session.pending_tools[tool_id] = ToolExecution(
+            tool_id=tool_id,
+            tooluse=ToolUse("shell", [], "echo hi"),
+        )
         session.generating = True
 
         chat_config = ChatConfig()
         chat_config.workspace = Path("/tmp")
-
-        # This event lets us know the tool function was actually called.
         tool_called = threading.Event()
 
         def fake_execute(**kwargs):
-            """Simulate the interrupt firing while the tool is executing."""
-            # Interrupt clears generating while we "run" the tool.
-            # pending_tools is already empty (execute_tool_thread pop()s it
-            # before calling execute).
             session.generating = False
             session.generating_since = None
             tool_called.set()
-            return []  # no tool outputs
+            return []
 
         with (
-            patch("gptme.server.session_step._start_step_thread") as mock_start_step,
-            # Patch at the class level — ToolUse is a frozen dataclass, so
-            # instance-level attribute assignment raises FrozenInstanceError.
+            patch("gptme.server.session_step._start_step_thread") as start_step,
             patch.object(ToolUse, "execute", side_effect=fake_execute),
             patch("gptme.server.session_step.prepare_execution_environment"),
             patch("gptme.server.session_step.SessionManager.add_event"),
@@ -1529,15 +1568,15 @@ class TestInterruptToolExecutionRace:
                 reserved=True,
             )
             thread.join(timeout=5)
-            assert tool_called.is_set(), "fake_execute was never called"
 
-        # The interrupt cleared generating; _start_step_thread must NOT have been called.
-        mock_start_step.assert_not_called()
+        assert tool_called.is_set(), "fake_execute was never called"
+        start_step.assert_not_called()
 
+    @pytest.mark.parametrize("reserved", [False, True])
     def test_continuation_step_proceeds_when_not_interrupted(
-        self, conv, client: FlaskClient
+        self, conv, client: FlaskClient, reserved: bool
     ):
-        """execute_tool_thread starts the continuation step when generating stays True."""
+        """Both auto-confirm and pre-reserved tool paths continue normally."""
         import threading
         from pathlib import Path
         from unittest.mock import patch
@@ -1577,10 +1616,18 @@ class TestInterruptToolExecutionRace:
                 edited_tooluse=None,
                 model="mock/model",
                 chat_config=chat_config,
-                reserved=True,
+                reserved=reserved,
             )
             thread.join(timeout=5)
             assert tool_called.is_set(), "fake_execute was never called"
 
-        # No interrupt — _start_step_thread must have been called once.
-        mock_start_step.assert_called_once()
+        # The worker must dispatch both unreserved auto-confirm continuations
+        # and pre-reserved rerun continuations.
+        mock_start_step.assert_called_once_with(
+            conv["conversation_id"],
+            session,
+            "mock/model",
+            chat_config.workspace,
+            branch="main",
+            reserved=reserved,
+        )
