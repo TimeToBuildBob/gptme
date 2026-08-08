@@ -1458,3 +1458,129 @@ class TestTranscriptEndpointInputValidation:
         data = response.get_json()
         assert data is not None
         assert "call_sid" in data["error"]
+
+
+# --- Interrupt + tool-execution race condition tests ---
+
+
+class TestInterruptToolExecutionRace:
+    """Tests for the race between interrupt and execute_tool_thread continuation.
+
+    Scenario: user sends interrupt while a tool is executing. The interrupt
+    handler clears session.generating and pending_tools. When the tool thread
+    finishes, it must NOT start a new LLM step (which would append a spurious
+    "[INTERRUPTED]" message and waste an API call).
+    """
+
+    def test_no_continuation_step_when_interrupted_during_tool_execution(
+        self, conv, client: FlaskClient
+    ):
+        """execute_tool_thread must not start an LLM step when generating was cleared."""
+        import threading
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from gptme.config import ChatConfig
+        from gptme.server.session_step import start_tool_execution
+
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+
+        # Pre-register the tool — execute_tool_thread will pop() it.
+        tool_id = "test-interrupt-race-tool"
+        tooluse = ToolUse("shell", [], "echo hi")
+        tool_exec = ToolExecution(tool_id=tool_id, tooluse=tooluse)
+        session.pending_tools[tool_id] = tool_exec
+
+        # Pre-reserve generation exactly as the rerun/step routes do.
+        session.generating = True
+
+        chat_config = ChatConfig()
+        chat_config.workspace = Path("/tmp")
+
+        # This event lets us know the tool function was actually called.
+        tool_called = threading.Event()
+
+        def fake_execute(**kwargs):
+            """Simulate the interrupt firing while the tool is executing."""
+            # Interrupt clears generating while we "run" the tool.
+            # pending_tools is already empty (execute_tool_thread pop()s it
+            # before calling execute).
+            session.generating = False
+            session.generating_since = None
+            tool_called.set()
+            return []  # no tool outputs
+
+        with (
+            patch("gptme.server.session_step._start_step_thread") as mock_start_step,
+            # Patch at the class level — ToolUse is a frozen dataclass, so
+            # instance-level attribute assignment raises FrozenInstanceError.
+            patch.object(ToolUse, "execute", side_effect=fake_execute),
+            patch("gptme.server.session_step.prepare_execution_environment"),
+            patch("gptme.server.session_step.SessionManager.add_event"),
+        ):
+            thread = start_tool_execution(
+                conversation_id=conv["conversation_id"],
+                session=session,
+                tool_id=tool_id,
+                edited_tooluse=None,
+                model="mock/model",
+                chat_config=chat_config,
+                reserved=True,
+            )
+            thread.join(timeout=5)
+            assert tool_called.is_set(), "fake_execute was never called"
+
+        # The interrupt cleared generating; _start_step_thread must NOT have been called.
+        mock_start_step.assert_not_called()
+
+    def test_continuation_step_proceeds_when_not_interrupted(
+        self, conv, client: FlaskClient
+    ):
+        """execute_tool_thread starts the continuation step when generating stays True."""
+        import threading
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from gptme.config import ChatConfig
+        from gptme.server.session_step import start_tool_execution
+
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+
+        tool_id = "test-no-interrupt-tool"
+        tooluse = ToolUse("shell", [], "echo ok")
+        tool_exec = ToolExecution(tool_id=tool_id, tooluse=tooluse)
+        session.pending_tools[tool_id] = tool_exec
+        session.generating = True
+
+        chat_config = ChatConfig()
+        chat_config.workspace = Path("/tmp")
+
+        tool_called = threading.Event()
+
+        def fake_execute(**kwargs):
+            """Normal execution — generating stays True (no interrupt)."""
+            tool_called.set()
+            return []
+
+        with (
+            patch("gptme.server.session_step._start_step_thread") as mock_start_step,
+            patch.object(ToolUse, "execute", side_effect=fake_execute),
+            patch("gptme.server.session_step.prepare_execution_environment"),
+            patch("gptme.server.session_step.SessionManager.add_event"),
+        ):
+            thread = start_tool_execution(
+                conversation_id=conv["conversation_id"],
+                session=session,
+                tool_id=tool_id,
+                edited_tooluse=None,
+                model="mock/model",
+                chat_config=chat_config,
+                reserved=True,
+            )
+            thread.join(timeout=5)
+            assert tool_called.is_set(), "fake_execute was never called"
+
+        # No interrupt — _start_step_thread must have been called once.
+        mock_start_step.assert_called_once()
