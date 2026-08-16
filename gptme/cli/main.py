@@ -1149,6 +1149,7 @@ def main(
 
     if show_prompt_stats:
         stats_root = Path(tempfile.mkdtemp(prefix="gptme-prompt-stats-"))
+        stats_setup_fallback_ran = False
         try:
             stats_logdir = stats_root / "log"
             if workspace == "@log":
@@ -1189,6 +1190,7 @@ def main(
                         e,
                     )
                     stats_tool_allowlist_str = tool_allowlist_str  # pre-manifest
+                    stats_setup_fallback_ran = True
                     try:
                         config = setup_config_from_cli(
                             workspace=stats_workspace_path,
@@ -1225,7 +1227,7 @@ def main(
             try:
                 tools = init_tools(config.chat.tools)
             except ValueError as e:
-                if tool_manifest_type:
+                if tool_manifest_type and not stats_setup_fallback_ran:
                     # Manifest tool unavailable (MCP server may not be running).
                     # Warn and retry without the manifest tools.
                     logger.warning(
