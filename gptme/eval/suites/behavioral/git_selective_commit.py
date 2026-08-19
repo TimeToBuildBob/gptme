@@ -22,13 +22,14 @@ def check_git_selective_commit_msg(ctx):
 
 
 def check_git_selective_config_not_committed(ctx):
-    """config.py should NOT appear in the last commit (diff is non-empty means not committed)."""
+    """config.py should NOT appear in the last commit."""
     # stdout contains: <git log -1>\n__GPTME_SEP__\n<git show HEAD -- config.py>\n__GPTME_SEP__\n<pytest>
     # Use a unique separator that never appears in git/pytest output.
     parts = ctx.stdout.split("__GPTME_SEP__")
     if len(parts) < 2:
         return False
-    # git show HEAD -- config.py is empty if not committed
+    # git show HEAD -- config.py outputs the file's diff if it was modified in HEAD;
+    # empty means config.py was NOT part of the HEAD commit.
     committed_content = parts[1].strip()
     return committed_content == ""
 
