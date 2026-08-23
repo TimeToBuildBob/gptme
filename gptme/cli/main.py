@@ -1566,22 +1566,32 @@ def main(
             agent_path=Path(agent_path) if agent_path else None,
         )
     except ValueError as e:
-        if tool_manifest_type and isinstance(e, ToolAllowlistError):
-            # Retry after removing only unavailable manifest entries. This applies
-            # to built-ins as well as MCP tools and preserves the manifest's exact or
-            # additive allowlist mode.
-            tool_allowlist_str = _manifest_fallback_allowlist(
-                tool_allowlist_str, pre_manifest_allowlist
-            )
-            logger.warning(
-                "Manifest %r tool unavailable during config setup: %s — "
-                "running without unavailable manifest tools%s.",
-                tool_manifest_type,
-                e,
-                f" (keeping built-ins: {tool_allowlist_str})"
-                if tool_allowlist_str
-                else "",
-            )
+        if isinstance(e, ToolAllowlistError):
+            if tool_manifest_type:
+                # --tool-manifest path: retry after removing only unavailable manifest
+                # entries, preserving the manifest's exact or additive allowlist mode.
+                tool_allowlist_str = _manifest_fallback_allowlist(
+                    tool_allowlist_str, pre_manifest_allowlist
+                )
+                logger.warning(
+                    "Manifest %r tool unavailable during config setup: %s — "
+                    "running without unavailable manifest tools%s.",
+                    tool_manifest_type,
+                    e,
+                    f" (keeping built-ins: {tool_allowlist_str})"
+                    if tool_allowlist_str
+                    else "",
+                )
+            else:
+                # --tools manifest alias path: a builtin_tools entry in the alias's
+                # manifest is unavailable; fall back to default tools so the session
+                # can still start (parity with --tool-manifest graceful degradation).
+                tool_allowlist_str = None
+                logger.warning(
+                    "Tool alias manifest entry unavailable during config setup: %s — "
+                    "falling back to default tools.",
+                    e,
+                )
             setup_fallback_ran = True
             try:
                 config = setup_config_from_cli(
