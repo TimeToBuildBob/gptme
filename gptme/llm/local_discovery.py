@@ -151,7 +151,7 @@ def discover_local_providers(
         return [_probe_one(to_probe[0], timeout, fetch_fn, configured_index)]
 
     results: list[DiscoveryResult | None] = [None] * len(to_probe)
-    with ThreadPoolExecutor(max_workers=len(to_probe)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(to_probe), 8)) as pool:
         futs = {
             pool.submit(_probe_one, cand, timeout, fetch_fn, configured_index): i
             for i, cand in enumerate(to_probe)
