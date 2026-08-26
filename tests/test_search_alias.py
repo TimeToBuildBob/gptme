@@ -218,27 +218,24 @@ class TestUtilSubcommandMirroring:
             ["/usr/local/bin/gptme-util", "chats", "list", "--help"]
         )
 
-    def test_util_subcmd_after_double_dash_forwards_help(self, runner: CliRunner):
-        """gptme -- chats list --help still forwards --help to gptme-util.
+    def test_util_subcmd_after_double_dash_does_not_dispatch(self, runner: CliRunner):
+        """gptme -- chats list marks double_dash_seen so main() skips gptme-util dispatch.
 
-        '--' ends option processing: Click treats 'chats', 'list', and '--help' all
-        as positionals.  The parse_args fix ensures '--' is recognised as the
-        end-of-options delimiter (not mis-classified as a bare option flag), so
-        allow_interspersed_args is never incorrectly set to False.  The observable
-        result is unchanged: gptme-util still receives chats list --help.
+        '--' signals end-of-options: everything that follows is a literal prompt,
+        not a shortcut invocation.  This is consistent with how '-' separates
+        chained prompts in gptme's own syntax.
+
+        We test at the parse_args level (ctx.meta flag) to avoid spinning up a
+        full gptme session — the dispatch guard in main() reads that same flag.
         """
-        with (
-            patch(
-                "gptme.cli.main.shutil.which",
-                return_value="/usr/local/bin/gptme-util",
-            ),
-            patch("gptme.cli.main.subprocess.call", return_value=0) as mock_call,
-        ):
-            result = runner.invoke(main, ["--", "chats", "list", "--help"])
-        assert result.exit_code == 0
-        mock_call.assert_called_once_with(
-            ["/usr/local/bin/gptme-util", "chats", "list", "--help"]
-        )
+        import click
+
+        from gptme.cli.main import _DynamicHelpCommand
+
+        cmd = _DynamicHelpCommand(name="gptme", params=main.params)
+        ctx = click.Context(cmd)
+        cmd.parse_args(ctx, ["--", "chats", "list", "--help"])
+        assert ctx.meta.get("double_dash_seen") is True
 
     def test_util_subcmd_skipped_for_version_flag(self, runner: CliRunner):
         """gptme --version chats does not trigger gptme-util dispatch."""

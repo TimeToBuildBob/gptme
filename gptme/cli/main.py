@@ -121,11 +121,11 @@ class _DynamicHelpCommand(click.Command):
                 skip_next = False
                 continue
             if a == "--":
-                # End-of-options delimiter: stop scanning for a subcommand name.
-                # With allow_interspersed_args still True, Click treats everything
-                # after '--' as positionals.  main() will still see the first
-                # positional as prompts[0] and forward to gptme-util, so dispatch
-                # does occur for `gptme -- chats list --help`.
+                # End-of-options delimiter: stop scanning and record the flag.
+                # main() checks double_dash_seen to suppress gptme-util dispatch,
+                # treating `gptme -- chats list` as literal prompts (consistent
+                # with how '-' separates chained prompts in gptme syntax).
+                ctx.meta["double_dash_seen"] = True
                 break
             if a.startswith("-"):
                 # --opt=val form carries its value inline; bare --opt consumes next token.
@@ -825,7 +825,8 @@ def main(
 
     # gptme-util subcommand mirroring: `gptme chats [...]` → `gptme-util chats [...]`
     # Any top-level gptme-util subcommand can be invoked without typing 'gptme-util'.
-    if prompts and not show_version:
+    # Suppress when '--' preceded the subcommand: those prompts are literal, not shortcuts.
+    if prompts and not show_version and not ctx.meta.get("double_dash_seen"):
         from .util import UTIL_SUBCOMMANDS  # cheap: just a sorted list constant
 
         if prompts[0] in UTIL_SUBCOMMANDS:
