@@ -13,6 +13,7 @@ from .decision import (
 )
 from .engine import auto_compact_log
 from .handlers import (
+    _compact_auto,
     _compact_resume,
     _compact_summarize,
     _compact_trim,
@@ -53,6 +54,7 @@ __all__ = [
     "_compact_trim",
     "_compact_summarize",
     "_compact_resume",  # deprecated alias for _compact_summarize
+    "_compact_auto",  # deprecated alias for _compact_trim
     # Hook
     "autocompact_hook",
     "_get_compacted_name",

@@ -50,6 +50,7 @@ def cmd_compact_handler(ctx) -> Generator[Message, None, None]:
         yield Message(
             "system",
             f"⚠️  '/compact {method}' is deprecated. Use '/compact {canonical}' instead.",
+            hide=True,
         )
         method = canonical
 
