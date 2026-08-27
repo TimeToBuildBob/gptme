@@ -84,7 +84,12 @@ def _slugify(name: str) -> str:
 
 
 def _update_memory_index(
-    memory_dir: Path, slug: str, filename: str, description: str
+    memory_dir: Path,
+    slug: str,
+    filename: str,
+    description: str,
+    file_path: Path | None = None,
+    file_content: str | None = None,
 ) -> None:
     """Add or update an entry in MEMORY.md.
 
@@ -94,6 +99,11 @@ def _update_memory_index(
 
     An exclusive file lock serialises concurrent index updates so that parallel
     sessions cannot race and silently drop each other's entries.
+
+    If ``file_path`` and ``file_content`` are provided, the memory file is
+    written under the same lock so that concurrent saves to the same slug are
+    fully serialised — the write and index update are atomic with respect to
+    each other.
     """
     index_path = memory_dir / "MEMORY.md"
     entry = f"- [{slug}]({filename}) — {description}\n"
@@ -102,6 +112,12 @@ def _update_memory_index(
     with open(index_path, "a+", encoding="utf-8") as f:
         _lock_exclusive(f)
         try:
+            # Write the memory file under the same lock so concurrent saves to
+            # the same slug are serialised: no two sessions can interleave
+            # their write_text calls on the same .md file.
+            if file_path is not None and file_content is not None:
+                file_path.write_text(file_content, encoding="utf-8")
+
             f.seek(0)
             content = f.read()
             if not content:
@@ -151,10 +167,14 @@ def save_memory(name: str, content: str, workspace: Path | None = None) -> str:
 
     safe_desc = description.replace("\\", "\\\\").replace('"', '\\"')
     frontmatter = f'---\nname: {slug}\ndescription: "{safe_desc}"\nmetadata:\n  type: general\n---\n\n'
-    file_path.write_text(frontmatter + body + "\n", encoding="utf-8")
+    file_content = frontmatter + body + "\n"
 
     # Use slug as the index key so colliding names update the same entry.
-    _update_memory_index(memory_dir, slug, filename, description)
+    # Pass file_path + file_content so the write happens under the index lock,
+    # serialising concurrent saves to the same slug.
+    _update_memory_index(
+        memory_dir, slug, filename, description, file_path, file_content
+    )
 
     logger.debug(f"Saved memory '{name}' to {file_path}")
     return str(file_path)

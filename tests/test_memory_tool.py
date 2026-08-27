@@ -62,6 +62,25 @@ class TestUpdateMemoryIndex:
         # Should not duplicate
         assert index.count("test.md") == 1
 
+    def test_writes_memory_file_under_lock_when_provided(self, tmp_path):
+        """file_path/file_content params write the memory file inside the index lock."""
+        memory_dir = tmp_path / "memory"
+        memory_dir.mkdir()
+        file_path = memory_dir / "test.md"
+        file_content = '---\nname: test\ndescription: "A test"\n---\n\nBody\n'
+        _update_memory_index(
+            memory_dir,
+            "test",
+            "test.md",
+            "A test",
+            file_path=file_path,
+            file_content=file_content,
+        )
+        assert file_path.exists()
+        assert file_path.read_text() == file_content
+        index = (memory_dir / "MEMORY.md").read_text()
+        assert "- [test](test.md) — A test" in index
+
 
 class TestSaveMemory:
     def test_creates_memory_file(self, tmp_path):
