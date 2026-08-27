@@ -117,6 +117,22 @@ def test_reset_clears_accumulator():
     assert _get_session_tokens() == 0
 
 
+def test_tracking_failure_does_not_abort_chat(caplog):
+    """Optional token tracking must not fail the LLM turn."""
+    with (
+        patch.object(
+            chat_module, "len_tokens", side_effect=RuntimeError("no tokenizer")
+        ),
+        caplog.at_level("WARNING", logger="gptme.chat"),
+    ):
+        _log_token_usage(
+            [Message("user", "hi")], Message("assistant", "ok"), "mock/gpt-mock"
+        )
+
+    assert _get_session_tokens() == 0
+    assert "Failed to track token usage" in caplog.text
+
+
 def test_output_handles_unknown_context_limit(capsys):
     """Models without known context metadata still report usage."""
     meta = _make_model_meta(context=None)
@@ -133,6 +149,23 @@ def test_output_handles_unknown_context_limit(capsys):
     assert captured.out == ""
     assert "context: 100 / unknown" in captured.err
     assert "session total: 120" in captured.err
+
+
+def test_setup_exception_restores_outer_accumulator(tmp_path):
+    """A setup failure after reset must restore the caller's token total."""
+    chat_module._session_tokens.set([120])
+
+    with (
+        patch.object(
+            chat_module,
+            "set_current_conv_name",
+            side_effect=RuntimeError("setup failed"),
+        ),
+        pytest.raises(RuntimeError, match="setup failed"),
+    ):
+        chat_module.chat([], [], tmp_path, tmp_path, model="mock/gpt-mock")
+
+    assert _get_session_tokens() == 120
 
 
 def test_accumulator_restored_after_nested_chat_same_context():

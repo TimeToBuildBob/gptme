@@ -92,8 +92,7 @@ def _log_token_usage(msgs: list[Message], msg_response: Message, model: str) -> 
             flush=True,
         )
     except Exception:
-        # Informational only — never crash the main chat loop over token display.
-        pass
+        logger.warning("Failed to track token usage", exc_info=True)
 
 
 @trace_function(name="chat.main", attributes={"component": "chat"})
