@@ -455,6 +455,33 @@ describe('WelcomeView', () => {
     expect(screen.getByText(/Cannot reach/i)).toBeInTheDocument();
   });
 
+  it('reveals the disconnected banner when auto-connect transitions from in-progress to settled', async () => {
+    // Exercises the live observable: the component must re-render reactively when
+    // isAutoConnecting$ flips false — not just read the value at mount time.
+    mockBaseUrl = 'http://my-server.example.com:5700';
+    isConnected$.set(false);
+    isAutoConnecting$.set(true);
+
+    render(
+      <SettingsProvider>
+        <WelcomeView />
+      </SettingsProvider>
+    );
+
+    // Banner is suppressed while auto-connect is in progress
+    expect(screen.queryByText(/Cannot reach/i)).not.toBeInTheDocument();
+
+    // Auto-connect finishes without establishing a connection
+    act(() => {
+      isAutoConnecting$.set(false);
+    });
+
+    // Banner must appear reactively — validates the use$(isAutoConnecting$) subscription
+    await waitFor(() => {
+      expect(screen.getByText(/Cannot reach/i)).toBeInTheDocument();
+    });
+  });
+
   it('shows a finish-setup banner when the server has no provider configured', async () => {
     let resolveFetch:
       | ((value: { ok: boolean; json: () => Promise<{ provider_configured: boolean }> }) => void)
