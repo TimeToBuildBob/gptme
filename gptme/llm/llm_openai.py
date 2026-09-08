@@ -930,6 +930,78 @@ def retry_generator_on_openai_error(
     return decorator
 
 
+# --- grammar-constrained decoding for the non-native tool formats -----------
+#
+# The native ``tool`` format already gets constrained decoding for free: tool
+# definitions go to the provider as JSON schemas and the server constrains the
+# generated arguments against them.  The ``markdown`` and ``xml`` formats get
+# nothing -- they are parsed heuristically out of free text -- so a model can
+# emit a mismatched fence or an unclosed ``<tool-use>`` block and truncate its
+# own tool call.
+#
+# An OpenAI-compatible server with structured-output support (vLLM) can
+# constrain those formats too, given a context-free grammar.  Opt in by
+# pointing ``GPTME_TOOL_FORMAT_GRAMMAR`` at a grammar file.
+#
+# vLLM feeds the grammar string to ``xgrammar.Grammar.from_ebnf``, so write
+# GBNF-flavoured EBNF with a rule named ``root``.  (A grammar containing no
+# ``::=`` line is routed through a lossy Lark-to-EBNF converter instead.)
+_GRAMMAR_CAPABLE_PROVIDERS: set[str] = {"local"}
+_GRAMMAR_TOOL_FORMATS = ("markdown", "xml")
+_GRAMMAR_MAX_BYTES = 1_000_000
+
+
+@lru_cache(maxsize=8)
+def _load_tool_format_grammar(path: str, mtime: float) -> str:
+    """Read and cache a grammar file, keyed on path and mtime."""
+    del mtime  # only part of the cache key
+    text = os.path.expanduser(path)
+    with open(text, encoding="utf-8") as f:
+        content = f.read(_GRAMMAR_MAX_BYTES + 1)
+    if len(content) > _GRAMMAR_MAX_BYTES:
+        raise ValueError(
+            f"Tool-format grammar is larger than {_GRAMMAR_MAX_BYTES} bytes: {path}"
+        )
+    if not content.strip():
+        raise ValueError(f"Tool-format grammar file is empty: {path}")
+    return content
+
+
+def _tool_format_grammar(provider: Provider) -> str | None:
+    """Return the grammar this request should be constrained with, if any."""
+    if provider not in _GRAMMAR_CAPABLE_PROVIDERS and not is_custom_provider(
+        str(provider)
+    ):
+        return None
+    path = get_config().get_env("GPTME_TOOL_FORMAT_GRAMMAR")
+    if not path:
+        return None
+
+    from ..tools import get_tool_format  # fmt: skip
+
+    if get_tool_format() not in _GRAMMAR_TOOL_FORMATS:
+        # native tool calling is already constrained against the tool schemas
+        return None
+    resolved = os.path.expanduser(path)
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f"GPTME_TOOL_FORMAT_GRAMMAR not found: {resolved}")
+    return _load_tool_format_grammar(resolved, os.path.getmtime(resolved))
+
+
+def _maybe_apply_tool_format_grammar(body: dict[str, Any], provider: Provider) -> None:
+    """Add the structured-output grammar field when one is configured."""
+    grammar = _tool_format_grammar(provider)
+    if grammar is None:
+        return
+    # vLLM removed the `guided_*` request fields in v0.12.0 and *silently
+    # ignores* them since, so `structured_outputs` is the default.  Older
+    # servers only understand the legacy field.
+    if get_config().get_env_bool("GPTME_TOOL_FORMAT_GRAMMAR_LEGACY", False):
+        body["guided_grammar"] = grammar
+    else:
+        body["structured_outputs"] = {"grammar": grammar}
+
+
 def _maybe_apply_verbosity(body: dict[str, Any], model_meta: ModelMeta) -> None:
     """Add verbosity request-body field for GPT-5+ models when set.
 
@@ -1169,6 +1241,7 @@ def extra_body(
     """Return extra body for the OpenAI API based on the model."""
     body: dict[str, Any] = {}
     _maybe_apply_verbosity(body, model_meta)
+    _maybe_apply_tool_format_grammar(body, provider)
     if provider == "moonshot" and model_meta.model == "kimi-k3":
         effort = get_config().get_env("GPTME_THINKING_EFFORT")
         if effort is not None:

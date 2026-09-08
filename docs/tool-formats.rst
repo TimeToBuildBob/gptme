@@ -190,6 +190,48 @@ Resolution order, highest priority first:
 Switching model at runtime with ``/model`` also switches to that model's
 ``default_tool_format`` if it declares one.
 
+Constrained decoding for ``markdown`` and ``xml``
+-------------------------------------------------
+
+The ``tool`` format gets constrained decoding for free: tool definitions go to
+the provider as JSON schemas and the server constrains generated arguments
+against them. ``markdown`` and ``xml`` get nothing — they are parsed
+heuristically out of free text, which is why a mismatched fence or an unclosed
+``<tool-use>`` block can truncate a model's own tool call.
+
+On a self-hosted OpenAI-compatible server that supports structured outputs
+(notably vLLM), those two formats can be constrained as well, by handing the
+server a context-free grammar for the format. Point
+``GPTME_TOOL_FORMAT_GRAMMAR`` at a grammar file:
+
+.. code-block:: sh
+
+    export OPENAI_BASE_URL=http://localhost:8000/v1
+    export GPTME_TOOL_FORMAT_GRAMMAR=/path/to/gptme_markdown.ebnf
+    gptme --model local/my-model --tool-format markdown "hello"
+
+The grammar is sent as ``structured_outputs.grammar`` in the request body.
+Details worth knowing:
+
+- **Only ``markdown`` and ``xml``.** With ``--tool-format tool`` the option is
+  ignored, since native tool calling is already schema-constrained.
+
+- **Only self-hosted providers** — ``local`` and config-file custom providers.
+  Hosted APIs would reject the unknown request field.
+
+- **Write GBNF-flavoured EBNF with a rule named ``root``.** vLLM passes the
+  string to ``xgrammar.Grammar.from_ebnf``. A grammar containing no ``::=``
+  line is treated as Lark and routed through a lossy converter, so prefer EBNF.
+  Validate locally with ``xgrammar.Grammar.from_ebnf`` first: vLLM collapses
+  every grammar error into a single opaque "Invalid grammar specification".
+
+- **Check your vLLM version.** ``structured_outputs`` landed in vLLM 0.11.0.
+  The older ``guided_grammar`` field was removed in 0.12.0 and is *silently
+  ignored* since — a request looks fine and comes back unconstrained. For a
+  server older than 0.11.0, set ``GPTME_TOOL_FORMAT_GRAMMAR_LEGACY=1`` to send
+  ``guided_grammar`` instead.
+
+
 .. _tool-format-model-metadata:
 
 Model metadata
