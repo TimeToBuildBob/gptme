@@ -80,6 +80,7 @@ from .shell_background import (
 )
 from .shell_validation import (
     _find_first_unquoted_pipe,
+    _find_heredoc_regions,
     check_with_shellcheck,
     is_allowlisted,
     is_denylisted,
@@ -1116,10 +1117,9 @@ class ShellSession:
                     if not data:
                         # EOF: bash closed this pipe, which in practice means the
                         # command terminated the shell (`exit`, `exec`, a fatal
-                        # signal). A closed pipe stays readable, so without this
-                        # check the loop spins until the command timeout (20 min
-                        # by default) and only the *next* command's BrokenPipe
-                        # restarts the shell. Report it now and restart here.
+                        # signal). Drain both pipes before restarting: select may
+                        # report stdout EOF before buffered stderr (or vice versa).
+                        self._drain_closed_shell_pipes(stdout, stderr, output)
                         return self._handle_shell_exit(stdout, stderr)
                     lines = data.splitlines(keepends=True)
                     re_returncode = re.compile(r"ReturnCode:(\d+)")
@@ -1231,6 +1231,28 @@ class ShellSession:
             partial_stdout = trim_blank_lines("".join(stdout))
             partial_stderr = trim_blank_lines("".join(stderr))
             raise KeyboardInterrupt((partial_stdout, partial_stderr)) from None
+
+    def _drain_closed_shell_pipes(
+        self, stdout: list[str], stderr: list[str], output: bool
+    ) -> None:
+        """Drain output buffered on both pipes after the shell exits."""
+        open_fds = {self.stdout_fd, self.stderr_fd}
+        while open_fds:
+            readable = _wait_readable(list(open_fds), 0.1)
+            if not readable:
+                if self.process.poll() is not None:
+                    break
+                continue
+            for fd in readable:
+                data = os.read(fd, 2**16).decode("utf-8", errors="replace")
+                if not data:
+                    open_fds.discard(fd)
+                    continue
+                target = stdout if fd == self.stdout_fd else stderr
+                stream = sys.stdout if fd == self.stdout_fd else sys.stderr
+                target.append(data)
+                if output:
+                    print(data, end="", file=stream)
 
     def _handle_shell_exit(
         self, stdout: list[str], stderr: list[str]
@@ -2054,12 +2076,20 @@ def execute_shell(
     cmd_lower = cmd_stripped.lower()
     cmd_parts = cmd_stripped.split(maxsplit=1)
 
-    # Check for bg command - can be on any line (Issue #992)
-    # Split into lines and find if any line starts with "bg "
+    # Check for bg command - can be on any line (Issue #992). Heredoc bodies
+    # are data, not commands, so exclude their source ranges from this scan.
     lines = cmd_stripped.split("\n")
+    heredoc_regions = _find_heredoc_regions(cmd_stripped)
     bg_line_idx = None
+    line_start = 0
     for i, line in enumerate(lines):
         line_stripped = line.strip().lower()
+        is_heredoc_data = any(
+            start <= line_start < end for start, end in heredoc_regions
+        )
+        line_start += len(line) + 1
+        if is_heredoc_data:
+            continue
         if line_stripped == "bg":
             # Bare `bg` is bash's job-control builtin, which can never work in
             # the tool shell (non-interactive: "bg: no job control"). Refuse the

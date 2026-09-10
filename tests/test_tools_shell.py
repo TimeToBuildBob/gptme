@@ -1830,6 +1830,14 @@ def test_bare_bg_is_refused_without_running_anything(cmd):
     assert "no job control" in msgs[0]
 
 
+def test_bare_bg_in_heredoc_data_passes_through_to_bash():
+    """A line containing only `bg` can be inert heredoc data."""
+    cmd = "cat <<'EOF'\nbg\nEOF"
+    msgs, bash_cmds = _run_overlay_probe(cmd)
+    assert bash_cmds == [cmd]
+    assert msgs == []
+
+
 def test_kill_pid_passes_through_when_not_a_job_id():
     """`kill <pid>` reaches bash unless <pid> names a live overlay job."""
     from gptme.tools.shell import reset_background_jobs, start_background_job
@@ -1925,6 +1933,27 @@ def test_shell_exit_returns_promptly_and_restarts(cmd, code):
         assert shell.process.pid != old_pid
         rc, stdout, _ = shell.run("echo alive")
         assert (rc, stdout) == (0, "alive")
+    finally:
+        shell.close()
+
+
+@pytest.mark.timeout(30)
+def test_shell_exit_drains_both_output_pipes():
+    """An EOF on one pipe must not discard buffered output from the other."""
+    from gptme.tools.shell import ShellSession
+
+    shell = ShellSession()
+    try:
+        # Closing stdout first makes its EOF readable before the later stderr
+        # write, deterministically exercising the cross-pipe drain.
+        rc, stdout, stderr = shell.run(
+            "exec 1>&-; sleep 0.05; printf 'stderr diagnostic\\n' >&2; exit 7",
+            timeout=20.0,
+        )
+        assert rc == 7
+        assert stdout == ""
+        assert "stderr diagnostic" in stderr
+        assert "shell exited" in stderr
     finally:
         shell.close()
 
