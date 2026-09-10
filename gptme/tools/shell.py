@@ -221,9 +221,10 @@ For long-running commands (dev servers, builds):
 - `wait <id> [timeout]` - wait for completion; timeout leaves the job running
 - `kill <id>` - terminate
 
-Avoids blocking on commands like `npm run dev` that run indefinitely.
-`bg` always takes the command on the same line; bash's bare `bg`/`fg` do not
-work here (no job control). Never run `exit` — the shell is persistent.
+Use `bg <command>` so long-running work does not block the agent and can be
+checked incrementally without losing the stateful shell. Bash's bare `bg`/`fg`
+do not work here (no job control). Preserve cwd, variables, and background jobs
+for later calls by never running `exit` — the shell is persistent.
 """.strip()
 
 instructions_format: dict[str, str] = {}
