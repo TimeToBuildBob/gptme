@@ -1771,14 +1771,162 @@ def test_wait_command_dispatches_timeout():
     """The shell control command passes job ID and timeout to the wait handler."""
     from unittest.mock import patch
 
+    from gptme.tools.shell import (
+        execute_shell,
+        reset_background_jobs,
+        start_background_job,
+    )
+
+    reset_background_jobs()
+    job = start_background_job("sleep 5")
+    try:
+        with patch(
+            "gptme.tools.shell.execute_wait_command", return_value=iter([])
+        ) as execute_wait:
+            list(execute_shell(f"wait {job.id} 2m", [], None))
+
+        execute_wait.assert_called_once_with(str(job.id), "2m")
+    finally:
+        reset_background_jobs()
+
+
+def _run_overlay_probe(cmd: str) -> tuple[list[str], list[str]]:
+    """Run `cmd` through execute_shell with bash execution mocked out.
+
+    Returns (system message contents, commands that reached bash).
+    """
+    from unittest.mock import patch
+
+    from gptme.hooks.confirm import ConfirmationResult
     from gptme.tools.shell import execute_shell
 
-    with patch(
-        "gptme.tools.shell.execute_wait_command", return_value=iter([])
-    ) as execute_wait:
-        list(execute_shell("wait 7 2m", [], None))
+    with (
+        patch(
+            "gptme.hooks.get_confirmation",
+            return_value=ConfirmationResult.confirm(),
+        ),
+        patch("gptme.tools.shell.execute_shell_impl", return_value=iter([])) as impl,
+    ):
+        msgs = [m.content for m in execute_shell(cmd, [], None)]
+    return msgs, [call.args[0] for call in impl.call_args_list]
 
-    execute_wait.assert_called_once_with("7", "2m")
+
+@pytest.mark.parametrize("cmd", ["bg", "sleep 30\nbg", "bg\necho after", "BG"])
+def test_bare_bg_is_refused_without_running_anything(cmd):
+    """Bare `bg` is bash job control, which the tool shell lacks.
+
+    Regression for the "sleep 30 / bg" stall: the whole block must be refused
+    with a usage message before the preceding foreground line runs.
+    """
+    from unittest.mock import patch
+
+    with patch("gptme.tools.shell.execute_bg_command") as bg:
+        msgs, bash_cmds = _run_overlay_probe(cmd)
+
+    assert bash_cmds == []
+    bg.assert_not_called()
+    assert len(msgs) == 1
+    assert "bg <command>" in msgs[0]
+    assert "no job control" in msgs[0]
+
+
+def test_kill_pid_passes_through_when_not_a_job_id():
+    """`kill <pid>` reaches bash unless <pid> names a live overlay job."""
+    from gptme.tools.shell import reset_background_jobs, start_background_job
+
+    reset_background_jobs()
+    try:
+        msgs, bash_cmds = _run_overlay_probe("kill 424242")
+        assert bash_cmds == ["kill 424242"]
+        assert msgs == []
+
+        job = start_background_job("sleep 5")
+        msgs, bash_cmds = _run_overlay_probe(f"kill {job.id}")
+        assert bash_cmds == []
+        assert f"Terminated job #{job.id}" in msgs[0]
+        assert not job.is_running()
+
+        # Signal forms never intercept, so they are the unambiguous escape hatch.
+        msgs, bash_cmds = _run_overlay_probe(f"kill -TERM {job.id}")
+        assert bash_cmds == [f"kill -TERM {job.id}"]
+    finally:
+        reset_background_jobs()
+
+
+@pytest.mark.parametrize("cmd", ["wait $!", "wait %1", "wait 424242 1s"])
+def test_wait_non_job_passes_through_to_bash(cmd):
+    """`wait` on PIDs and bash job specs is bash's wait, not the overlay's."""
+    from gptme.tools.shell import reset_background_jobs
+
+    reset_background_jobs()
+    msgs, bash_cmds = _run_overlay_probe(cmd)
+    assert bash_cmds == [cmd]
+    # A numeric target that is not a job id gets a hint; `$!`/`%1` do not.
+    if "424242" in cmd:
+        assert len(msgs) == 1 and "No background job #424242" in msgs[0]
+    else:
+        assert msgs == []
+
+
+def test_wait_known_job_still_uses_overlay():
+    from gptme.tools.shell import reset_background_jobs, start_background_job
+
+    reset_background_jobs()
+    try:
+        job = start_background_job("echo waited")
+        msgs, bash_cmds = _run_overlay_probe(f"wait {job.id}")
+        assert bash_cmds == []
+        assert f"Job #{job.id}" in msgs[0]
+        assert "waited" in msgs[0]
+    finally:
+        reset_background_jobs()
+
+
+@pytest.mark.parametrize("cmd", ["output --help", "output foo.txt", "output -n 3"])
+def test_output_program_passes_through_to_bash(cmd):
+    """A non-numeric `output` argument means a program called output, not a job."""
+    msgs, bash_cmds = _run_overlay_probe(cmd)
+    assert bash_cmds == [cmd]
+    assert msgs == []
+
+
+def test_output_numeric_still_uses_overlay():
+    from gptme.tools.shell import reset_background_jobs
+
+    reset_background_jobs()
+    msgs, bash_cmds = _run_overlay_probe("output 424242")
+    assert bash_cmds == []
+    assert "No job with ID #424242" in msgs[0]
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize(
+    ("cmd", "code"), [("exit", 0), ("exit 3", 3), ("false || exit 1", 1)]
+)
+def test_shell_exit_returns_promptly_and_restarts(cmd, code):
+    """A command that kills bash must not stall until the command timeout.
+
+    Before the EOF check, `exit` spun on the closed pipe for the full
+    GPTME_SHELL_TIMEOUT (20 min by default), returned -124, and only the next
+    command's BrokenPipeError restarted the shell.
+    """
+    import time
+
+    from gptme.tools.shell import ShellSession
+
+    shell = ShellSession()
+    try:
+        old_pid = shell.process.pid
+        start = time.monotonic()
+        rc, _stdout, stderr = shell.run(cmd, timeout=20.0)
+        assert time.monotonic() - start < 5.0
+        assert rc == code
+        assert "shell exited" in stderr
+        assert shell.process.pid != old_pid
+        rc, stdout, _ = shell.run("echo alive")
+        assert (rc, stdout) == (0, "alive")
+    finally:
+        shell.close()
 
 
 def test_execute_bg_command():

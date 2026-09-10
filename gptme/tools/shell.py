@@ -221,9 +221,18 @@ For long-running commands (dev servers, builds):
 - `kill <id>` - terminate
 
 Avoids blocking on commands like `npm run dev` that run indefinitely.
+`bg` always takes the command on the same line; bash's bare `bg`/`fg` do not
+work here (no job control). Never run `exit` — the shell is persistent.
 """.strip()
 
 instructions_format: dict[str, str] = {}
+
+_BARE_BG_MESSAGE = (
+    "`bg` needs a command on the same line: `bg <command>` starts <command> as "
+    "a background job and returns a job id. Bash's bare `bg` cannot work in "
+    "this shell (no job control), so nothing was run. To background the "
+    "previous line, rewrite it as `bg <that command>`, e.g. `bg npm run dev`."
+)
 
 
 def examples(tool_format):
@@ -1104,6 +1113,14 @@ class ShellSession:
                     # 2**12 = 4096
                     # 2**16 = 65536
                     data = os.read(fd, 2**16).decode("utf-8", errors="replace")
+                    if not data:
+                        # EOF: bash closed this pipe, which in practice means the
+                        # command terminated the shell (`exit`, `exec`, a fatal
+                        # signal). A closed pipe stays readable, so without this
+                        # check the loop spins until the command timeout (20 min
+                        # by default) and only the *next* command's BrokenPipe
+                        # restarts the shell. Report it now and restart here.
+                        return self._handle_shell_exit(stdout, stderr)
                     lines = data.splitlines(keepends=True)
                     re_returncode = re.compile(r"ReturnCode:(\d+)")
                     for line in lines:
@@ -1214,6 +1231,35 @@ class ShellSession:
             partial_stdout = trim_blank_lines("".join(stdout))
             partial_stderr = trim_blank_lines("".join(stderr))
             raise KeyboardInterrupt((partial_stdout, partial_stderr)) from None
+
+    def _handle_shell_exit(
+        self, stdout: list[str], stderr: list[str]
+    ) -> tuple[int | None, str, str]:
+        """The persistent shell died mid-command: restart it and report why.
+
+        Returns the shell's own exit status as the command's return code so
+        `exit 3` reads as 3, and appends a note to stderr so the model learns
+        that shell state (cwd, variables, `&` jobs) was reset rather than
+        seeing an empty result.
+        """
+        try:
+            rc: int | None = self.process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            rc = None
+        logger.warning(
+            "Shell process exited during command (code %s), restarting shell", rc
+        )
+        self.restart()
+        stderr.append(
+            f"\n[gptme] The shell exited (code {rc}), so a fresh shell was "
+            "started; cwd, variables and `&` jobs from the old shell are gone. "
+            "Don't run `exit` in the tool shell — it never needs to be exited.\n"
+        )
+        return (
+            rc if rc is not None else -1,
+            trim_blank_lines("".join(stdout)),
+            trim_blank_lines("".join(stderr)),
+        )
 
     def _terminate_process(self) -> None:
         """Terminate the shell process, platform-aware."""
@@ -2014,6 +2060,13 @@ def execute_shell(
     bg_line_idx = None
     for i, line in enumerate(lines):
         line_stripped = line.strip().lower()
+        if line_stripped == "bg":
+            # Bare `bg` is bash's job-control builtin, which can never work in
+            # the tool shell (non-interactive: "bg: no job control"). Refuse the
+            # whole block up front so a preceding long-running line
+            # (`sleep 30` then `bg`) is not run in the foreground first.
+            yield Message("system", _BARE_BG_MESSAGE)
+            return
         if line_stripped.startswith("bg "):
             bg_line_idx = i
             break
@@ -2153,20 +2206,32 @@ def execute_shell(
         yield from execute_jobs_command()
         return
 
-    if cmd_lower.startswith("output "):
-        # Show output from job: output <id>
-        job_id_str = cmd_parts[1] if len(cmd_parts) > 1 else ""
-        yield from execute_output_command(job_id_str)
+    # Overlay control commands take a numeric job id. Anything else is bash:
+    # `output --help` is a program named output, `wait $!` / `wait <pid>` /
+    # `wait %1` address `&` children of the persistent shell.
+    if cmd_lower.startswith("output ") and cmd_parts[1].split()[0].isdigit():
+        # Show output from job: output <id> [--new]
+        yield from execute_output_command(cmd_parts[1])
         return
 
     if cmd_lower.startswith("wait "):
         wait_parts = cmd_stripped.split()
-        if len(wait_parts) not in (2, 3):
-            yield Message("system", "Usage: `wait <job-id> [timeout]`")
+        wait_target = wait_parts[1]
+        if wait_target.isdigit() and get_background_job(int(wait_target)):
+            if len(wait_parts) > 3:
+                yield Message("system", "Usage: `wait <job-id> [timeout]`")
+                return
+            timeout_str = wait_parts[2] if len(wait_parts) == 3 else None
+            yield from execute_wait_command(wait_target, timeout_str)
             return
-        timeout_str = wait_parts[2] if len(wait_parts) == 3 else None
-        yield from execute_wait_command(wait_parts[1], timeout_str)
-        return
+        if wait_target.isdigit():
+            yield Message(
+                "system",
+                f"No background job #{wait_target} (use `jobs` to list them); "
+                f"passing `wait {wait_target}` to the shell, which accepts PIDs "
+                "of its own `&` children.",
+            )
+        # Fall through to bash for PIDs, `$!`, `%1`, and bare job specs.
 
     if cmd_lower.startswith("kill ") and len(cmd_parts) == 2:
         # Check if this looks like a job kill (just a number)
