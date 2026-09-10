@@ -1138,8 +1138,7 @@ class ShellSession:
                                 trim_blank_lines("".join(stdout)),
                                 trim_blank_lines("".join(stderr)),
                             )
-                        self._drain_closed_shell_pipes(stdout, stderr, output)
-                        return self._handle_shell_exit(stdout, stderr)
+                        return self._handle_shell_exit(stdout, stderr, output)
                     lines = data.splitlines(keepends=True)
                     re_returncode = re.compile(r"ReturnCode:(\d+)")
                     for line in lines:
@@ -1277,7 +1276,7 @@ class ShellSession:
                     print(data, end="", file=stream)
 
     def _handle_shell_exit(
-        self, stdout: list[str], stderr: list[str]
+        self, stdout: list[str], stderr: list[str], output: bool
     ) -> tuple[int | None, str, str]:
         """The persistent shell died mid-command: restart it and report why.
 
@@ -1290,6 +1289,7 @@ class ShellSession:
             rc: int | None = self.process.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
             rc = None
+        self._drain_closed_shell_pipes(stdout, stderr, output)
         logger.warning(
             "Shell process exited during command (code %s), restarting shell", rc
         )
