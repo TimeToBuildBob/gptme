@@ -398,6 +398,10 @@ class ShellSession:
         # close on exit
         atexit.register(self.close)
 
+    def get_cwd(self) -> Path:
+        """Return the persistent shell's effective working directory."""
+        return Path(self._cwd or os.getcwd())
+
     def _init(self):
         # Choose shell and process group settings based on platform
         if _is_windows:
@@ -988,7 +992,8 @@ class ShellSession:
                             ):
                                 ex, pwd, _ = self._run("pwd", output=False)
                                 if ex == 0:
-                                    os.chdir(pwd.strip())
+                                    self._cwd = pwd.strip()
+                                    os.chdir(self._cwd)
 
                             # Drain remaining stderr
                             stop_event.set()
@@ -1161,7 +1166,7 @@ class ShellSession:
                             rc_matches = re_returncode.findall(line)
                             if rc_matches:
                                 return_code = int(rc_matches[-1])
-                            # if command is cd, update working directory
+                            # If command is cd, track the persistent shell's cwd.
                             if (
                                 command == "cd" or command.startswith("cd ")
                             ) and return_code == 0:
@@ -1172,7 +1177,8 @@ class ShellSession:
                                         "working directory"
                                     )
                                 else:
-                                    os.chdir(pwd.strip())
+                                    self._cwd = pwd.strip()
+                                    os.chdir(self._cwd)
 
                             # Issue #408: Drain any remaining stderr before
                             # returning. Use multiple attempts to ensure stderr
@@ -1752,7 +1758,7 @@ def execute_shell_impl(
 ) -> Generator[Message, None, None]:
     """Execute shell command and format output."""
     shell = get_shell()
-    allowlisted = is_allowlisted(cmd)
+    allowlisted = is_allowlisted(cmd, cwd=shell.get_cwd())
 
     start_time = time.monotonic()
     try:
@@ -2145,6 +2151,7 @@ def execute_shell(
             preview_lang="bash",
             confirm_msg="Run command in background?",
             allow_edit=not _has_surrounding,
+            confirmation_workspace=get_shell().get_cwd(),
         )
         return
 
@@ -2227,6 +2234,7 @@ def execute_shell(
         preview_lang="bash",
         confirm_msg="Run command?",
         allow_edit=True,
+        confirmation_workspace=get_shell().get_cwd(),
     )
 
 
