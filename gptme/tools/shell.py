@@ -402,6 +402,14 @@ class ShellSession:
         """Return the persistent shell's effective working directory."""
         return Path(self._cwd or os.getcwd())
 
+    def _set_cwd(self, cwd: str) -> None:
+        """Synchronize the tracked cwd with the persistent shell."""
+        if not cwd:
+            logger.warning("pwd returned an empty working directory")
+            return
+        self._cwd = cwd
+        os.chdir(cwd)
+
     def _init(self):
         # Choose shell and process group settings based on platform
         if _is_windows:
@@ -837,7 +845,12 @@ class ShellSession:
 
         full_command = f"echo {start_marker_pattern}\n"  # Start marker first
         full_command += f"{command}\n"
-        full_command += f"echo ReturnCode:$? {self.delimiter}\n"
+        # Capture the command status before querying PWD so the marker preserves
+        # the command's exit code while also reporting the shell's effective cwd.
+        full_command += (
+            f'__gptme_rc=$?; printf "ReturnCode:%s PWD:%s {self.delimiter}\\n" '
+            '"$__gptme_rc" "$PWD"\n'
+        )
         try:
             self.process.stdin.write(full_command)
         except BrokenPipeError:
@@ -987,13 +1000,11 @@ class ShellSession:
                             rc_matches = re_returncode.findall(line)
                             if rc_matches:
                                 return_code = int(rc_matches[-1])
-                            if (command == "cd" or command.startswith("cd ")) and (
-                                return_code == 0
-                            ):
-                                ex, pwd, _ = self._run("pwd", output=False)
-                                if ex == 0:
-                                    self._cwd = pwd.strip()
-                                    os.chdir(self._cwd)
+                            cwd_match = re.search(
+                                rf" PWD:(.*?) {re.escape(self.delimiter)}", line
+                            )
+                            if cwd_match:
+                                self._set_cwd(cwd_match.group(1))
 
                             # Drain remaining stderr
                             stop_event.set()
@@ -1166,19 +1177,11 @@ class ShellSession:
                             rc_matches = re_returncode.findall(line)
                             if rc_matches:
                                 return_code = int(rc_matches[-1])
-                            # If command is cd, track the persistent shell's cwd.
-                            if (
-                                command == "cd" or command.startswith("cd ")
-                            ) and return_code == 0:
-                                ex, pwd, _ = self._run("pwd", output=False)
-                                if ex != 0:
-                                    logger.warning(
-                                        "pwd failed after cd, cannot update "
-                                        "working directory"
-                                    )
-                                else:
-                                    self._cwd = pwd.strip()
-                                    os.chdir(self._cwd)
+                            cwd_match = re.search(
+                                rf" PWD:(.*?) {re.escape(self.delimiter)}", line
+                            )
+                            if cwd_match:
+                                self._set_cwd(cwd_match.group(1))
 
                             # Issue #408: Drain any remaining stderr before
                             # returning. Use multiple attempts to ensure stderr
