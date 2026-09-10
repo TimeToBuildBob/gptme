@@ -606,6 +606,8 @@ class ShellSession:
         Never re-runs the command that was in flight: it may have partially or
         fully executed (e.g. ``git commit && kill -9 $$``).
         """
+        if self._closed:
+            return
         logger.warning(
             "Warning: shell process died (%s, %s), restarting",
             _describe_exit_status(status),
@@ -1330,6 +1332,12 @@ class ShellSession:
                                 )
                             self._drain_closed_shell_pipes(stdout, stderr, output)
                             restored = self._has_state_snapshot()
+                            if self._closed:
+                                return (
+                                    -1,
+                                    trim_blank_lines("".join(stdout)),
+                                    trim_blank_lines("".join(stderr)),
+                                )
                             self.restart()
                             if restored:
                                 note = (
@@ -1571,11 +1579,12 @@ class ShellSession:
                 pass
 
     def restart(self):
+        if self._closed:
+            return
         self._restarting = True
         try:
             self.close()
             self._init()
-            self._closed = False
         finally:
             self._restarting = False
 
