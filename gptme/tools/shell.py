@@ -1115,11 +1115,24 @@ class ShellSession:
                     # 2**16 = 65536
                     data = os.read(fd, 2**16).decode("utf-8", errors="replace")
                     if not data:
-                        # EOF: bash closed this pipe, which in practice means the
-                        # command terminated the shell (`exit`, `exec`, a fatal
-                        # signal). Drain both pipes before restarting: select may
-                        # report stdout EOF before buffered stderr (or vice versa).
+                        # A pipe can close before bash's process status becomes
+                        # observable. Drain both descriptors, then wait briefly
+                        # before deciding whether this was a shell exit. If bash
+                        # remains alive, returning is safer than killing it: the
+                        # command permanently closed one of the persistent pipes.
                         self._drain_closed_shell_pipes(stdout, stderr, output)
+                        try:
+                            self.process.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            stderr.append(
+                                "\n[gptme] The command closed a persistent shell "
+                                "output pipe; shell state was preserved.\n"
+                            )
+                            return (
+                                -1,
+                                trim_blank_lines("".join(stdout)),
+                                trim_blank_lines("".join(stderr)),
+                            )
                         return self._handle_shell_exit(stdout, stderr)
                     lines = data.splitlines(keepends=True)
                     re_returncode = re.compile(r"ReturnCode:(\d+)")
@@ -1237,14 +1250,17 @@ class ShellSession:
     ) -> None:
         """Drain output buffered on both pipes after the shell exits."""
         open_fds = {self.stdout_fd, self.stderr_fd}
-        while open_fds:
+        deadline = time.monotonic() + 1.0
+        while open_fds and time.monotonic() < deadline:
             readable = _wait_readable(list(open_fds), 0.1)
             if not readable:
-                if self.process.poll() is not None:
-                    break
                 continue
             for fd in readable:
-                data = os.read(fd, 2**16).decode("utf-8", errors="replace")
+                try:
+                    data = os.read(fd, 2**16).decode("utf-8", errors="replace")
+                except OSError:
+                    open_fds.discard(fd)
+                    continue
                 if not data:
                     open_fds.discard(fd)
                     continue

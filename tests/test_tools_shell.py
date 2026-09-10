@@ -1958,6 +1958,25 @@ def test_shell_exit_drains_both_output_pipes():
         shell.close()
 
 
+@pytest.mark.timeout(30)
+def test_closing_output_pipe_does_not_restart_live_shell():
+    """EOF alone is not proof that the persistent bash process exited."""
+    from gptme.tools.shell import ShellSession
+
+    shell = ShellSession()
+    try:
+        old_pid = shell.process.pid
+        rc, _stdout, stderr = shell.run(
+            "exec 1>&-; while :; do sleep 1; done", timeout=20.0
+        )
+        assert rc == -1
+        assert "output pipe" in stderr
+        assert shell.process.poll() is None
+        assert shell.process.pid == old_pid
+    finally:
+        shell.close()
+
+
 def test_execute_bg_command():
     """Test the bg command handler."""
     from gptme.tools.shell import execute_bg_command, reset_background_jobs
