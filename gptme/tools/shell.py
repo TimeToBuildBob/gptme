@@ -1115,24 +1115,30 @@ class ShellSession:
                     # 2**16 = 65536
                     data = os.read(fd, 2**16).decode("utf-8", errors="replace")
                     if not data:
-                        # A pipe can close before bash's process status becomes
-                        # observable. Drain both descriptors, then wait briefly
-                        # before deciding whether this was a shell exit. If bash
-                        # remains alive, returning is safer than killing it: the
-                        # command permanently closed one of the persistent pipes.
+                        # A closed output pipe makes this persistent shell
+                        # unusable even if bash itself remains alive. Restart it
+                        # after collecting output from the other pipe so the next
+                        # command gets a complete, working shell.
                         self._drain_closed_shell_pipes(stdout, stderr, output)
                         try:
                             self.process.wait(timeout=1.0)
                         except subprocess.TimeoutExpired:
+                            self._terminate_process()
+                            self.process.wait(timeout=1.0)
+                            self._drain_closed_shell_pipes(stdout, stderr, output)
+                            self.restart()
                             stderr.append(
                                 "\n[gptme] The command closed a persistent shell "
-                                "output pipe; shell state was preserved.\n"
+                                "output pipe, so a fresh shell was started; cwd, "
+                                "variables and `&` jobs from the old shell are "
+                                "gone.\n"
                             )
                             return (
                                 -1,
                                 trim_blank_lines("".join(stdout)),
                                 trim_blank_lines("".join(stderr)),
                             )
+                        self._drain_closed_shell_pipes(stdout, stderr, output)
                         return self._handle_shell_exit(stdout, stderr)
                     lines = data.splitlines(keepends=True)
                     re_returncode = re.compile(r"ReturnCode:(\d+)")

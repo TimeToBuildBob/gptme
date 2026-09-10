@@ -1830,12 +1830,21 @@ def test_bare_bg_is_refused_without_running_anything(cmd):
     assert "no job control" in msgs[0]
 
 
-def test_bare_bg_in_heredoc_data_passes_through_to_bash():
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cat <<'EOF'\nbg\nEOF",
+        "cat <<EOF\n  EOF\nbg\nEOF",
+        "cat <<-EOF\n  EOF\nbg\n\tEOF",
+    ],
+)
+def test_bare_bg_in_heredoc_data_passes_through_to_bash(cmd):
     """A line containing only `bg` can be inert heredoc data."""
-    cmd = "cat <<'EOF'\nbg\nEOF"
     msgs, bash_cmds = _run_overlay_probe(cmd)
     assert bash_cmds == [cmd]
-    assert msgs == []
+    # Shellcheck may warn about the intentionally delimiter-like data line,
+    # but the overlay must not reject it with the bare-bg usage message.
+    assert all("bg <command>" not in msg for msg in msgs)
 
 
 def test_kill_pid_passes_through_when_not_a_job_id():
@@ -1939,15 +1948,16 @@ def test_shell_exit_returns_promptly_and_restarts(cmd, code):
 
 @pytest.mark.timeout(30)
 def test_shell_exit_drains_both_output_pipes():
-    """An EOF on one pipe must not discard buffered output from the other."""
+    """An EOF on one pipe must not discard delayed output from the other."""
     from gptme.tools.shell import ShellSession
 
     shell = ShellSession()
     try:
-        # Closing stdout first makes its EOF readable before the later stderr
-        # write, deterministically exercising the cross-pipe drain.
+        # The diagnostic arrives after the initial drain deadline, while the
+        # reader is waiting for bash to exit. It still must be drained before
+        # the persistent shell is restarted.
         rc, stdout, stderr = shell.run(
-            "exec 1>&-; sleep 0.05; printf 'stderr diagnostic\\n' >&2; exit 7",
+            "exec 1>&-; sleep 1.1; printf 'stderr diagnostic\\n' >&2; exit 7",
             timeout=20.0,
         )
         assert rc == 7
@@ -1959,8 +1969,8 @@ def test_shell_exit_drains_both_output_pipes():
 
 
 @pytest.mark.timeout(30)
-def test_closing_output_pipe_does_not_restart_live_shell():
-    """EOF alone is not proof that the persistent bash process exited."""
+def test_closing_output_pipe_restarts_broken_shell():
+    """A live shell with a permanently closed output pipe must be replaced."""
     from gptme.tools.shell import ShellSession
 
     shell = ShellSession()
@@ -1971,8 +1981,11 @@ def test_closing_output_pipe_does_not_restart_live_shell():
         )
         assert rc == -1
         assert "output pipe" in stderr
-        assert shell.process.poll() is None
-        assert shell.process.pid == old_pid
+        assert "fresh shell" in stderr
+        assert shell.process.pid != old_pid
+
+        rc, stdout, _stderr = shell.run("echo alive", timeout=5.0)
+        assert (rc, stdout) == (0, "alive")
     finally:
         shell.close()
 
