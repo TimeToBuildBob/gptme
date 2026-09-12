@@ -2076,6 +2076,7 @@ class TestClarifyBlock:
             isolation_mode="worktree",
             worktree_path=deleted_worktree,
             repo_path=repo_path,
+            base_workdir=repo_path,
         )
         with _subagents_lock:
             _subagents.append(sa)
@@ -2095,6 +2096,57 @@ class TestClarifyBlock:
         assert captured["workdir"] == repo_path
         assert captured["isolated"] is True
         assert captured["isolation"] == "worktree"
+
+    def test_subagent_reply_recreates_non_git_isolation_from_original_workdir(
+        self, tmp_path, monkeypatch
+    ):
+        import importlib
+
+        cli_main = importlib.import_module("gptme.cli.main")
+        llm_models = importlib.import_module("gptme.llm.models")
+        profiles = importlib.import_module("gptme.profiles")
+        original_workdir = tmp_path / "original-non-git-workdir"
+        original_workdir.mkdir()
+        isolated_dir = tmp_path / "isolated-dir"
+        isolated_dir.mkdir()
+
+        monkeypatch.setattr(cli_main, "get_logdir", lambda name: tmp_path / name)
+        monkeypatch.setattr(llm_models, "get_default_model", lambda: None)
+        monkeypatch.setattr(profiles, "get_profile", lambda _: None)
+        monkeypatch.setattr(
+            "gptme.util.git_worktree.get_git_root", lambda workspace: None
+        )
+        monkeypatch.setattr("tempfile.mkdtemp", lambda **kwargs: str(isolated_dir))
+        monkeypatch.setattr(
+            subagent_execution, "_create_subagent_thread", lambda **kw: None
+        )
+        monkeypatch.setattr(subagent_execution, "_cleanup_isolation", lambda sa: None)
+
+        subagent(
+            "isolated-non-git-clarify",
+            "original task",
+            workdir=original_workdir,
+            isolated=True,
+        )
+        with _subagents_lock:
+            sa = next(s for s in _subagents if s.agent_id == "isolated-non-git-clarify")
+        assert sa.thread is not None
+        sa.thread.join(timeout=1)
+        assert sa.workdir == isolated_dir
+        assert sa.base_workdir == original_workdir
+        with _subagent_results_lock:
+            _subagent_results[sa.agent_id] = ReturnType(
+                "clarification_needed", "Which format?"
+            )
+
+        captured: dict = {}
+        monkeypatch.setattr(
+            subagent_api, "subagent", lambda **kwargs: captured.update(kwargs)
+        )
+        subagent_api.subagent_reply(sa.agent_id, "Use JSON.")
+
+        assert captured["workdir"] == original_workdir
+        assert captured["isolated"] is True
 
     def test_subagent_reply_rejects_excessive_clarifications(self, tmp_path):
         """subagent_reply() must reject after too many clarification rounds."""

@@ -503,6 +503,10 @@ def subagent(
             # Fallback to logdir's parent if cwd doesn't exist
             workspace = logdir.parent
 
+    # Preserve the pre-isolation workspace so clarification replies can recreate
+    # isolation even when the original workspace was not a Git repository.
+    base_workdir = workspace
+
     # Set up worktree isolation if requested
     worktree_path: Path | None = None
     repo_path: Path | None = None
@@ -732,6 +736,7 @@ def subagent(
             execution_mode="acp",
             acp_command=acp_command,
             workdir=workspace,
+            base_workdir=base_workdir,
             isolated=isolated,
             isolation_mode=isolation,
             worktree_path=worktree_path,
@@ -859,6 +864,7 @@ def subagent(
             process=None,
             execution_mode="subprocess",
             workdir=workspace,
+            base_workdir=base_workdir,
             isolated=isolated,
             isolation_mode=isolation,
             worktree_path=worktree_path,
@@ -1016,6 +1022,7 @@ def subagent(
             process=None,
             execution_mode="thread",
             workdir=workspace,
+            base_workdir=base_workdir,
             isolated=isolated,
             isolation_mode=isolation,
             worktree_path=worktree_path,
@@ -1503,6 +1510,7 @@ def subagent_continue(agent_id: str, message: str) -> None:
         acp_command=sa.acp_command,
         acp_session_id=sa.acp_session_id,
         workdir=sa.workdir,
+        base_workdir=sa.base_workdir,
         execution_mode=sa.execution_mode,
         isolated=sa.isolated,
         isolation_mode=sa.isolation_mode,
@@ -1600,9 +1608,9 @@ def subagent_reply(agent_id: str, reply: str) -> None:
             existing for existing in _subagents if existing.agent_id != agent_id
         ]
 
-    # Isolation cleanup removes the child workspace. Re-create a fresh isolated
-    # workspace from the original repo/cwd instead of passing the deleted path.
-    reply_workdir = sa.repo_path if sa.isolated else sa.workdir
+    # Isolation cleanup removes the child workspace. Re-create fresh isolation
+    # from the original workspace instead of passing the deleted child path.
+    reply_workdir = sa.base_workdir if sa.isolated else sa.workdir
 
     # Re-spawn with the same parameters, augmented prompt.
     # On failure, restore the old state so the caller can retry.

@@ -292,9 +292,11 @@ class Subagent:
     acp_command: str | None = None
     # Durable ACP session identifier, used to reload a child in a fresh process.
     acp_session_id: str | None = None
-    # Effective working directory used at spawn time. Stored so continuation and
-    # clarification replies do not depend on the parent's later cwd.
+    # Effective working directory used by the child at spawn time.
     workdir: Path | None = None
+    # Original workspace requested before isolation replaced it with a temporary
+    # directory/worktree. Needed to recreate cleaned isolation for replies.
+    base_workdir: Path | None = None
     # Worktree isolation fields
     isolated: bool = False
     worktree_path: Path | None = None
