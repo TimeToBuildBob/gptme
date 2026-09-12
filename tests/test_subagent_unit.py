@@ -1428,6 +1428,42 @@ class TestSubagentContinue:
         with _subagent_results_lock:
             _subagent_results.clear()
 
+    def test_acp_failure_keeps_session_id_for_continuation(self, tmp_path, monkeypatch):
+        cli_main = importlib.import_module("gptme.cli.main")
+        llm_models = importlib.import_module("gptme.llm.models")
+        profiles = importlib.import_module("gptme.profiles")
+        monkeypatch.setattr(cli_main, "get_logdir", lambda name: tmp_path / name)
+        monkeypatch.setattr(llm_models, "get_default_model", lambda: None)
+        monkeypatch.setattr(profiles, "get_profile", lambda _: None)
+        monkeypatch.setattr(subagent_execution, "_cleanup_isolation", lambda sa: None)
+
+        class FailingAcpClient:
+            def __init__(self, *args, **kwargs):
+                self.last_session_id = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def run(self, prompt, cwd=None):
+                self.last_session_id = "session-after-new"
+                raise RuntimeError("prompt failed")
+
+        import gptme.acp.client as acp_client
+
+        monkeypatch.setattr(acp_client, "GptmeAcpClient", FailingAcpClient)
+        subagent("acp-failure", "task", use_acp=True)
+        with _subagents_lock:
+            sa = next(s for s in _subagents if s.agent_id == "acp-failure")
+        assert sa.thread is not None
+        sa.thread.join(timeout=1)
+        assert not sa.thread.is_alive()
+        assert sa.acp_session_id == "session-after-new"
+        with _subagent_results_lock:
+            assert _subagent_results[sa.agent_id].status == "failure"
+
     def test_rejects_running_agent(self, tmp_path):
         from gptme.tools.subagent.api import subagent_continue
 
@@ -1509,6 +1545,47 @@ class TestSubagentContinue:
             continued = next(s for s in _subagents if s.agent_id == sa.agent_id)
         assert continued.thread is not None
         continued.thread.join(timeout=1)
+
+    def test_stale_watchdog_does_not_timeout_continuation(self, tmp_path, monkeypatch):
+        from gptme.tools.subagent.api import _timeout_subagent, subagent_continue
+
+        logdir = tmp_path / "watchdog-log"
+        logdir.mkdir()
+        (logdir / "conversation.jsonl").write_text(
+            '{"role":"assistant","content":"done"}\n'
+        )
+        old_run = Subagent(
+            agent_id="watchdog-agent",
+            prompt="task",
+            thread=None,
+            logdir=logdir,
+            model=None,
+        )
+        with _subagents_lock:
+            _subagents.append(old_run)
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_continuation(**kwargs):
+            started.set()
+            assert release.wait(timeout=1)
+
+        monkeypatch.setattr(
+            subagent_execution, "_create_subagent_thread", blocking_continuation
+        )
+        subagent_continue(old_run.agent_id, "follow up")
+        assert started.wait(timeout=1)
+
+        _timeout_subagent(old_run.agent_id, 30, old_run)
+
+        with _subagent_results_lock:
+            assert old_run.agent_id not in _subagent_results
+        release.set()
+        with _subagents_lock:
+            continued = next(s for s in _subagents if s.agent_id == old_run.agent_id)
+        assert continued.thread is not None
+        continued.thread.join(timeout=1)
+        assert not continued.thread.is_alive()
 
     def test_reuses_existing_conversation_log(self, tmp_path, monkeypatch):
         from gptme.logmanager import Log
@@ -1961,6 +2038,7 @@ class TestClarifyBlock:
             "profile": "custom-reviewer",
             "workdir": None,
             "isolated": True,
+            "isolation": None,
             "timeout": 42,
             "role": "verify",
             "redact_secrets": True,
@@ -1978,6 +2056,45 @@ class TestClarifyBlock:
         assert matching[0].context_include == ["workspace", "tools"]
         assert matching[0].profile == "custom-reviewer"
         assert matching[0].execution_mode == "acp"
+
+    def test_subagent_reply_recreates_cleaned_isolated_workspace(
+        self, tmp_path, monkeypatch
+    ):
+        from gptme.tools.subagent.api import subagent_reply
+
+        deleted_worktree = tmp_path / "removed-worktree"
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        sa = Subagent(
+            agent_id="isolated-clarify",
+            prompt="original task",
+            thread=None,
+            logdir=tmp_path / "old-log",
+            model=None,
+            workdir=deleted_worktree,
+            isolated=True,
+            isolation_mode="worktree",
+            worktree_path=deleted_worktree,
+            repo_path=repo_path,
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+        with _subagent_results_lock:
+            _subagent_results[sa.agent_id] = ReturnType(
+                "clarification_needed", "Which format?"
+            )
+        captured: dict = {}
+
+        def fake_subagent(**kwargs):
+            captured.update(kwargs)
+
+        monkeypatch.setattr(subagent_api, "subagent", fake_subagent)
+
+        subagent_reply(sa.agent_id, "Use JSON.")
+
+        assert captured["workdir"] == repo_path
+        assert captured["isolated"] is True
+        assert captured["isolation"] == "worktree"
 
     def test_subagent_reply_rejects_excessive_clarifications(self, tmp_path):
         """subagent_reply() must reject after too many clarification rounds."""
@@ -3176,6 +3293,33 @@ class TestMaxTimeWatchdog:
         assert result.status == "success", (
             "timeout must not overwrite an already-finished result"
         )
+
+    def test_timeout_subagent_noop_for_replaced_run(self, tmp_path):
+        from gptme.tools.subagent.api import _timeout_subagent
+
+        old_run = Subagent(
+            agent_id="reused-agent",
+            prompt="old",
+            thread=None,
+            logdir=tmp_path / "old",
+            model=None,
+        )
+        thread = MagicMock(spec=threading.Thread)
+        thread.is_alive.return_value = True
+        new_run = Subagent(
+            agent_id="reused-agent",
+            prompt="new",
+            thread=thread,
+            logdir=tmp_path / "new",
+            model=None,
+        )
+        with _subagents_lock:
+            _subagents.append(new_run)
+
+        _timeout_subagent("reused-agent", 5.0, old_run)
+
+        with _subagent_results_lock:
+            assert "reused-agent" not in _subagent_results
 
     def test_timeout_subagent_noop_when_not_found(self):
         """_timeout_subagent() is a no-op when the agent_id is unknown."""

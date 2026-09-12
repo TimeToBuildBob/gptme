@@ -455,7 +455,7 @@ def subagent(
         _timer = None
         if max_time is not None:
             _timer = threading.Timer(
-                max_time, _timeout_subagent, args=(agent_id, max_time)
+                max_time, _timeout_subagent, args=(agent_id, max_time, sa)
             )
             _timer.daemon = True
             _timer.start()
@@ -579,6 +579,15 @@ def subagent(
                 context_turns,
             )
 
+        def _save_acp_session_id(client: Any) -> None:
+            session_id = getattr(client, "last_session_id", None)
+            if not isinstance(session_id, str):
+                return
+            with _subagents_lock:
+                sa_ref = next((s for s in _subagents if s.agent_id == agent_id), None)
+            if sa_ref is not None:
+                object.__setattr__(sa_ref, "acp_session_id", session_id)
+
         def run_acp_subagent():
             # Bind retry generation at thread birth so test-teardown interrupts
             # abort backoffs even for LLM calls that start after teardown.
@@ -621,45 +630,38 @@ def subagent(
                                 if text:
                                     collected_text.append(text)
 
-                    async with GptmeAcpClient(
+                    client = GptmeAcpClient(
                         workspace=workspace,
                         command=acp_command,
                         auto_confirm=True,
                         on_update=on_update,
-                    ) as client:
-                        result = await client.run(prompt, cwd=workspace)
-                        session_id = getattr(client, "last_session_id", None)
-                        if isinstance(session_id, str):
-                            with _subagents_lock:
-                                sa_ref = next(
-                                    (s for s in _subagents if s.agent_id == agent_id),
-                                    None,
-                                )
-                            if sa_ref is not None:
-                                object.__setattr__(sa_ref, "acp_session_id", session_id)
-                        stop_reason = getattr(result, "stop_reason", "unknown")
-                        result_text = (
-                            "".join(collected_text) if collected_text else None
-                        )
+                    )
+                    try:
+                        async with client:
+                            result = await client.run(prompt, cwd=workspace)
+                    finally:
+                        # run() records the ID immediately after new_session(), so
+                        # retain it even when prompt() or connection teardown fails.
+                        _save_acp_session_id(client)
+                    stop_reason = getattr(result, "stop_reason", "unknown")
+                    result_text = "".join(collected_text) if collected_text else None
 
-                        clarification_result = (
-                            clarification_result_from_content(result_text)
+                    clarification_result = (
+                        clarification_result_from_content(result_text)
+                        if result_text
+                        else None
+                    )
+                    if clarification_result:
+                        status = clarification_result.status
+                        summary = clarification_result.result
+                    else:
+                        status = "success" if stop_reason == "end_turn" else "failure"
+                        summary = (
+                            result_text[:500]
                             if result_text
-                            else None
+                            else f"ACP stop_reason={stop_reason}"
                         )
-                        if clarification_result:
-                            status = clarification_result.status
-                            summary = clarification_result.result
-                        else:
-                            status = (
-                                "success" if stop_reason == "end_turn" else "failure"
-                            )
-                            summary = (
-                                result_text[:500]
-                                if result_text
-                                else f"ACP stop_reason={stop_reason}"
-                            )
-                        return status, summary
+                    return status, summary
 
                 try:
                     status, summary = asyncio.run(_acp_run())
@@ -1034,22 +1036,29 @@ def subagent(
     # The watchdog fires _timeout_subagent() after max_time seconds, which marks
     # a timeout result and delivers a notification via the LOOP_CONTINUE hook.
     if max_time is not None:
-        _timer = threading.Timer(max_time, _timeout_subagent, args=(agent_id, max_time))
+        _timer = threading.Timer(
+            max_time, _timeout_subagent, args=(agent_id, max_time, sa)
+        )
         _timer.daemon = True
         _timer.start()
 
 
-def _timeout_subagent(agent_id: str, max_time: float) -> None:
+def _timeout_subagent(
+    agent_id: str, max_time: float, expected_run: Subagent | None = None
+) -> None:
     """Internal: auto-cancel a subagent that exceeded its max_time wall-clock budget.
 
     Called by the watchdog timer launched in subagent(). Uses set_subagent_result_if_absent
     so a subagent that already completed normally is not affected (the race is handled
-    atomically).
+    atomically). ``expected_run`` prevents a stale timer from timing out a later run that
+    reused the same agent ID.
     """
     with _subagents_lock:
         sa = next((s for s in _subagents if s.agent_id == agent_id), None)
 
-    if sa is None or not sa.is_running():
+    if sa is None or (expected_run is not None and sa is not expected_run):
+        return  # Agent ID now belongs to another run
+    if not sa.is_running():
         return  # Already finished normally before the timer fired
 
     timeout_result = ReturnType(
@@ -1527,7 +1536,9 @@ def subagent_continue(agent_id: str, message: str) -> None:
     start_gate.set()
     if sa.max_time is not None:
         timer = threading.Timer(
-            sa.max_time, _timeout_subagent, args=(agent_id, sa.max_time)
+            sa.max_time,
+            _timeout_subagent,
+            args=(agent_id, sa.max_time, continued),
         )
         timer.daemon = True
         timer.start()
@@ -1589,6 +1600,10 @@ def subagent_reply(agent_id: str, reply: str) -> None:
             existing for existing in _subagents if existing.agent_id != agent_id
         ]
 
+    # Isolation cleanup removes the child workspace. Re-create a fresh isolated
+    # workspace from the original repo/cwd instead of passing the deleted path.
+    reply_workdir = sa.repo_path if sa.isolated else sa.workdir
+
     # Re-spawn with the same parameters, augmented prompt.
     # On failure, restore the old state so the caller can retry.
     try:
@@ -1603,8 +1618,9 @@ def subagent_reply(agent_id: str, reply: str) -> None:
             use_acp=sa.use_acp,
             acp_command=sa.acp_command or "gptme-acp",
             profile=sa.profile,
-            workdir=sa.workdir,
+            workdir=reply_workdir,
             isolated=sa.isolated,
+            isolation=sa.isolation_mode,
             timeout=sa.timeout,
             role=sa.role,
             redact_secrets=sa.redact_secrets,

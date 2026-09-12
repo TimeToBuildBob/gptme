@@ -230,6 +230,18 @@ class TestGptmeAcpClientInterface:
             assert _run(client.run("hello")) == "result"
         assert client.last_session_id == "session-123"
 
+    def test_run_keeps_created_session_id_when_prompt_fails(self, tmp_path):
+        client = self.GptmeAcpClient(workspace=tmp_path)
+        with (
+            patch.object(client, "new_session", AsyncMock(return_value="session-123")),
+            patch.object(
+                client, "prompt", AsyncMock(side_effect=RuntimeError("prompt failed"))
+            ),
+            pytest.raises(RuntimeError, match="prompt failed"),
+        ):
+            _run(client.run("hello"))
+        assert client.last_session_id == "session-123"
+
     def test_missing_command_raises(self, tmp_path):
         """Should raise FileNotFoundError if command isn't on PATH."""
         client = self.GptmeAcpClient(
