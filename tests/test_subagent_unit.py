@@ -1415,6 +1415,319 @@ class TestSubagentCancel:
 
 
 # ---------------------------------------------------------------------------
+# Completed subagent continuation tests
+# ---------------------------------------------------------------------------
+
+
+class TestSubagentContinue:
+    """Tests for resuming a completed child in its existing conversation."""
+
+    def setup_method(self):
+        with _subagents_lock:
+            _subagents.clear()
+        with _subagent_results_lock:
+            _subagent_results.clear()
+
+    def test_rejects_running_agent(self, tmp_path):
+        from gptme.tools.subagent.api import subagent_continue
+
+        thread = MagicMock(spec=threading.Thread)
+        thread.is_alive.return_value = True
+        sa = Subagent(
+            agent_id="running-agent",
+            prompt="task",
+            thread=thread,
+            logdir=tmp_path,
+            model=None,
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+
+        with pytest.raises(ValueError, match="still running"):
+            subagent_continue(sa.agent_id, "follow up")
+
+    def test_rejects_timed_out_thread_that_is_still_unwinding(self, tmp_path):
+        from gptme.tools.subagent.api import subagent_continue
+
+        logdir = tmp_path / "timed-out-log"
+        logdir.mkdir()
+        (logdir / "conversation.jsonl").write_text(
+            '{"role":"assistant","content":"done"}\n'
+        )
+        thread = MagicMock(spec=threading.Thread)
+        thread.is_alive.return_value = True
+        sa = Subagent(
+            agent_id="timed-out-agent",
+            prompt="task",
+            thread=thread,
+            logdir=logdir,
+            model=None,
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+        with _subagent_results_lock:
+            _subagent_results[sa.agent_id] = ReturnType("timeout", "timed out")
+
+        with pytest.raises(ValueError, match="still running"):
+            subagent_continue(sa.agent_id, "follow up")
+
+    def test_rejects_concurrent_continuation(self, tmp_path, monkeypatch):
+        from gptme.logmanager import Log
+        from gptme.message import Message
+        from gptme.tools.subagent.api import subagent_continue
+
+        logdir = tmp_path / "concurrent-log"
+        logdir.mkdir()
+        Log([Message("assistant", "```complete\ndone\n```")]).write_jsonl(
+            logdir / "conversation.jsonl"
+        )
+        sa = Subagent(
+            agent_id="concurrent-agent",
+            prompt="task",
+            thread=None,
+            logdir=logdir,
+            model=None,
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_continuation(**kwargs):
+            started.set()
+            assert release.wait(timeout=1)
+
+        monkeypatch.setattr(
+            subagent_execution, "_create_subagent_thread", blocking_continuation
+        )
+        subagent_continue(sa.agent_id, "first follow up")
+        assert started.wait(timeout=1)
+        with pytest.raises(ValueError, match="still running"):
+            subagent_continue(sa.agent_id, "second follow up")
+        release.set()
+        with _subagents_lock:
+            continued = next(s for s in _subagents if s.agent_id == sa.agent_id)
+        assert continued.thread is not None
+        continued.thread.join(timeout=1)
+
+    def test_reuses_existing_conversation_log(self, tmp_path, monkeypatch):
+        from gptme.logmanager import Log
+        from gptme.message import Message
+        from gptme.tools.subagent.api import subagent_continue
+
+        logdir = tmp_path / "subagent-log"
+        logdir.mkdir()
+        Log(
+            [
+                Message("user", "Remember that the launch code is ORBIT-41."),
+                Message("assistant", "```complete\nStored the launch code.\n```"),
+            ]
+        ).write_jsonl(logdir / "conversation.jsonl")
+
+        sa = Subagent(
+            agent_id="memory-agent",
+            prompt="Remember the launch code.",
+            thread=None,
+            logdir=logdir,
+            model="openai/gpt-4o-mini",
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+        with _subagent_results_lock:
+            _subagent_results[sa.agent_id] = ReturnType("success", "Stored it")
+
+        captured: dict = {}
+
+        def fake_create_subagent_thread(**kwargs):
+            captured.update(kwargs)
+            Log(
+                list(Log.read_jsonl(logdir / "conversation.jsonl"))
+                + [
+                    Message("user", kwargs["prompt"]),
+                    Message("assistant", "```complete\nThe code was ORBIT-41.\n```"),
+                ]
+            ).write_jsonl(logdir / "conversation.jsonl")
+
+        monkeypatch.setattr(
+            subagent_execution, "_create_subagent_thread", fake_create_subagent_thread
+        )
+
+        subagent_continue("memory-agent", "What was the launch code?")
+
+        with _subagents_lock:
+            continued = next(s for s in _subagents if s.agent_id == sa.agent_id)
+        assert continued.thread is not None
+        continued.thread.join(timeout=1)
+        assert not continued.thread.is_alive()
+
+        assert captured["logdir"] == logdir
+        assert captured["prompt"] == "What was the launch code?"
+        assert captured["resume"] is True
+        persisted = Log.read_jsonl(logdir / "conversation.jsonl")
+        assert len(persisted) == 4
+        assert "ORBIT-41" in persisted[-1].content
+        with _subagent_results_lock:
+            assert _subagent_results[sa.agent_id].status == "success"
+
+    def test_rejects_missing_conversation_log(self, tmp_path):
+        from gptme.tools.subagent.api import subagent_continue
+
+        sa = Subagent(
+            agent_id="missing-log-agent",
+            prompt="task",
+            thread=None,
+            logdir=tmp_path,
+            model=None,
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+        with _subagent_results_lock:
+            _subagent_results[sa.agent_id] = ReturnType("failure", "no log")
+
+        with pytest.raises(ValueError, match="no conversation log"):
+            subagent_continue(sa.agent_id, "follow up")
+
+    def test_rejects_cleaned_isolated_agent(self, tmp_path):
+        from gptme.tools.subagent.api import subagent_continue
+
+        logdir = tmp_path / "isolated-log"
+        logdir.mkdir()
+        (logdir / "conversation.jsonl").write_text(
+            '{"role":"assistant","content":"done"}\n'
+        )
+        sa = Subagent(
+            agent_id="isolated-agent",
+            prompt="task",
+            thread=None,
+            logdir=logdir,
+            model=None,
+            isolated=True,
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+
+        with pytest.raises(ValueError, match="isolated workspace"):
+            subagent_continue(sa.agent_id, "follow up")
+
+    def test_subprocess_reuses_existing_conversation(self, tmp_path, monkeypatch):
+        from gptme.logmanager import Log
+        from gptme.message import Message
+        from gptme.tools.subagent.api import subagent_continue
+
+        logdir = tmp_path / "subprocess-log"
+        logdir.mkdir()
+        Log([Message("assistant", "```complete\nFirst result\n```")]).write_jsonl(
+            logdir / "conversation.jsonl"
+        )
+        sa = Subagent(
+            agent_id="subprocess-agent",
+            prompt="first task",
+            thread=None,
+            logdir=logdir,
+            model=None,
+            execution_mode="subprocess",
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+
+        captured: dict = {}
+        process = MagicMock()
+
+        def fake_run_subprocess(**kwargs):
+            captured.update(kwargs)
+            return process
+
+        def fake_monitor(current):
+            assert current.process is process
+            with _subagent_results_lock:
+                _subagent_results[current.agent_id] = ReturnType(
+                    "success", "Second result"
+                )
+
+        monkeypatch.setattr(
+            subagent_execution, "_run_subagent_subprocess", fake_run_subprocess
+        )
+        monkeypatch.setattr(subagent_execution, "_monitor_subprocess", fake_monitor)
+
+        subagent_continue(sa.agent_id, "follow up")
+        with _subagents_lock:
+            continued = next(s for s in _subagents if s.agent_id == sa.agent_id)
+        assert continued.thread is not None
+        continued.thread.join(timeout=1)
+
+        assert captured["logdir"] == logdir
+        assert captured["resume"] is True
+        assert captured["prompt"] == "follow up"
+
+    def test_acp_reloads_existing_session(self, tmp_path, monkeypatch):
+        from gptme.logmanager import Log
+        from gptme.message import Message
+        from gptme.tools.subagent.api import subagent_continue
+
+        logdir = tmp_path / "acp-log"
+        logdir.mkdir()
+        Log([Message("assistant", "```complete\nFirst result\n```")]).write_jsonl(
+            logdir / "conversation.jsonl"
+        )
+        sa = Subagent(
+            agent_id="acp-agent",
+            prompt="first task",
+            thread=None,
+            logdir=logdir,
+            model=None,
+            use_acp=True,
+            execution_mode="acp",
+            acp_command="fake-acp",
+            acp_session_id="session-123",
+            workdir=tmp_path,
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+
+        calls: list[tuple] = []
+
+        class FakeAcpClient:
+            def __init__(self, *args, on_update=None, **kwargs):
+                self.on_update = on_update
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def load_session(self, session_id, cwd=None):
+                calls.append(("load", session_id, cwd))
+
+            async def prompt(self, session_id, message):
+                calls.append(("prompt", session_id, message))
+                chunk = MagicMock(text="Continued result")
+                self.on_update(
+                    session_id,
+                    MagicMock(type="agent_message_chunk", chunk=chunk),
+                )
+                return MagicMock(stop_reason="end_turn")
+
+        import gptme.acp.client as acp_client
+
+        monkeypatch.setattr(acp_client, "GptmeAcpClient", FakeAcpClient)
+        subagent_continue(sa.agent_id, "follow up")
+        with _subagents_lock:
+            continued = next(s for s in _subagents if s.agent_id == sa.agent_id)
+        assert continued.thread is not None
+        continued.thread.join(timeout=1)
+
+        assert calls == [
+            ("load", "session-123", tmp_path),
+            ("prompt", "session-123", "follow up"),
+        ]
+        with _subagent_results_lock:
+            assert _subagent_results[sa.agent_id] == ReturnType(
+                "success", "Continued result"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Clarification mechanism tests
 # ---------------------------------------------------------------------------
 

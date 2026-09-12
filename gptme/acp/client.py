@@ -257,6 +257,7 @@ class GptmeAcpClient:
         self._process: Any = None
         self._ctx: Any = None
         self._client_handler: Any = None
+        self.last_session_id: str | None = None
 
     # -- context manager ----------------------------------------------------
 
@@ -347,6 +348,25 @@ class GptmeAcpClient:
         logger.debug("ACP new_session → session_id=%s", resp.session_id)
         return resp.session_id
 
+    async def load_session(
+        self,
+        session_id: str,
+        cwd: str | Path | None = None,
+        mcp_servers: list[Any] | None = None,
+    ) -> Any:
+        """Load a durable ACP session into this client process."""
+        if self._conn is None:
+            raise RuntimeError(
+                "GptmeAcpClient is not connected; use as async context manager"
+            )
+        response = await self._conn.load_session(
+            cwd=str(cwd or self.workspace),
+            session_id=session_id,
+            mcp_servers=mcp_servers or [],
+        )
+        logger.debug("ACP load_session → session_id=%s", session_id)
+        return response
+
     async def prompt(
         self,
         session_id: str,
@@ -415,6 +435,7 @@ class GptmeAcpClient:
         session control.
         """
         session_id = await self.new_session(cwd=cwd)
+        self.last_session_id = session_id
         return await self.prompt(session_id, message)
 
 

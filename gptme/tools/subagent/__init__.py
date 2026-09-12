@@ -16,6 +16,7 @@ from ..base import ToolFunction, ToolSpec, ToolUse
 from .api import (
     subagent,
     subagent_cancel,
+    subagent_continue,
     subagent_list,
     subagent_read_log,
     subagent_reply,
@@ -399,6 +400,7 @@ Key features:
 - subagent_pipeline(items, *stages, timeout): Multi-stage fan-out with no barrier between stages — item A advances to stage 2 while item B is still in stage 1; each stage callable receives (item_prompt, prev_result) and returns the next stage's prompt
 - subagent_batch(): Start multiple subagents and return a BatchJob for explicit synchronization
 - subagent_cancel(): Cancel a running subagent (SIGTERM for subprocess, marks result for threads)
+- subagent_continue(agent_id, message): Continue a finished subagent in its existing conversation/session, preserving its full prior context (thread, subprocess, or ACP).
 - subagent_steer(agent_id, message): Inject a steering message into a RUNNING subagent's conversation — redirect, clarify, or course-correct mid-run without restarting. Works for thread-mode and subprocess-mode subagents. Distinct from subagent_reply() which only works on finished clarification_needed subagents.
 - subagent_wait_any(agent_ids, timeout): Wait for the first of N subagents to complete — returns (agent_id, result). Useful for race/hedging patterns.
 - subagent_reply(agent_id, reply): Answer a clarification request and re-spawn the subagent (for subagents that already stopped with clarification_needed status)
@@ -534,6 +536,7 @@ tool = ToolSpec(
         for f in [
             subagent,
             subagent_cancel,
+            subagent_continue,
             subagent_steer,
             subagent_list,
             subagent_reply,
@@ -571,6 +574,7 @@ __all__ = [
     # Public API
     "subagent",
     "subagent_cancel",
+    "subagent_continue",
     "subagent_steer",
     "subagent_list",
     "subagent_reply",

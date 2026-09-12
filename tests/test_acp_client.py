@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -205,6 +205,30 @@ class TestGptmeAcpClientInterface:
         client = self.GptmeAcpClient(workspace=tmp_path)
         with pytest.raises(RuntimeError, match="not connected"):
             _run(client.new_session())
+
+    def test_load_session_without_connect_raises(self, tmp_path):
+        client = self.GptmeAcpClient(workspace=tmp_path)
+        with pytest.raises(RuntimeError, match="not connected"):
+            _run(client.load_session("fake-session"))
+
+    def test_load_session_calls_protocol(self, tmp_path):
+        client = self.GptmeAcpClient(workspace=tmp_path)
+        client._conn = MagicMock()
+        client._conn.load_session = AsyncMock(return_value="loaded")
+
+        assert _run(client.load_session("session-123")) == "loaded"
+        client._conn.load_session.assert_awaited_once_with(
+            cwd=str(tmp_path), session_id="session-123", mcp_servers=[]
+        )
+
+    def test_run_records_created_session_id(self, tmp_path):
+        client = self.GptmeAcpClient(workspace=tmp_path)
+        with (
+            patch.object(client, "new_session", AsyncMock(return_value="session-123")),
+            patch.object(client, "prompt", AsyncMock(return_value="result")),
+        ):
+            assert _run(client.run("hello")) == "result"
+        assert client.last_session_id == "session-123"
 
     def test_missing_command_raises(self, tmp_path):
         """Should raise FileNotFoundError if command isn't on PATH."""

@@ -628,6 +628,15 @@ def subagent(
                         on_update=on_update,
                     ) as client:
                         result = await client.run(prompt, cwd=workspace)
+                        session_id = getattr(client, "last_session_id", None)
+                        if isinstance(session_id, str):
+                            with _subagents_lock:
+                                sa_ref = next(
+                                    (s for s in _subagents if s.agent_id == agent_id),
+                                    None,
+                                )
+                            if sa_ref is not None:
+                                object.__setattr__(sa_ref, "acp_session_id", session_id)
                         stop_reason = getattr(result, "stop_reason", "unknown")
                         result_text = (
                             "".join(collected_text) if collected_text else None
@@ -720,7 +729,7 @@ def subagent(
             process=None,
             execution_mode="acp",
             acp_command=acp_command,
-            workdir=workdir_path,
+            workdir=workspace,
             isolated=isolated,
             isolation_mode=isolation,
             worktree_path=worktree_path,
@@ -847,7 +856,7 @@ def subagent(
             output_schema=output_schema,
             process=None,
             execution_mode="subprocess",
-            workdir=workdir_path,
+            workdir=workspace,
             isolated=isolated,
             isolation_mode=isolation,
             worktree_path=worktree_path,
@@ -1004,7 +1013,7 @@ def subagent(
             output_schema=output_schema,
             process=None,
             execution_mode="thread",
-            workdir=workdir_path,
+            workdir=workspace,
             isolated=isolated,
             isolation_mode=isolation,
             worktree_path=worktree_path,
@@ -1291,6 +1300,237 @@ def subagent_steer(agent_id: str, message: str) -> str:
         "It will be injected at the subagent's next STEP_PRE checkpoint "
         "(before the next LLM call in the current agentic turn)."
     )
+
+
+def _collect_acp_update_text(update: Any, chunks: list[str]) -> None:
+    """Append text from an ACP agent-message update to ``chunks``."""
+    if getattr(update, "type", None) != "agent_message_chunk":
+        return
+    chunk = getattr(update, "chunk", None)
+    text = getattr(chunk, "text", None) or (
+        chunk.get("text") if isinstance(chunk, dict) else None
+    )
+    if text:
+        chunks.append(text)
+
+
+def _acp_result(response: Any, chunks: list[str]) -> ReturnType:
+    """Build a subagent result from ACP response metadata and text chunks."""
+    text = "".join(chunks) or None
+    clarification = clarification_result_from_content(text) if text else None
+    if clarification:
+        return clarification
+    if getattr(response, "stop_reason", None) == "end_turn":
+        return ReturnType("success", text)
+    return ReturnType("failure", text)
+
+
+def subagent_continue(agent_id: str, message: str) -> None:
+    """Continue a finished subagent in its existing conversation.
+
+    Thread and subprocess children append the follow-up to their original gptme
+    conversation log. ACP children reload their durable ACP session before the
+    prompt. Isolated children cannot be continued after their workspace cleanup.
+
+    Args:
+        agent_id: The completed subagent to continue.
+        message: Follow-up instruction for the child.
+    """
+    with _subagents_lock:
+        sa = next((s for s in _subagents if s.agent_id == agent_id), None)
+
+    if sa is None:
+        raise ValueError(f"Subagent with ID {agent_id!r} not found.")
+    # Cached timeout/cancel results can coexist with a thread that is still
+    # unwinding. Check the execution primitive directly before allowing a second
+    # writer into the same conversation.
+    if sa.is_running():
+        raise ValueError(
+            f"Subagent '{agent_id}' is still running. Use subagent_steer() instead."
+        )
+    if sa.execution_mode != "acp" and not (sa.logdir / "conversation.jsonl").exists():
+        raise ValueError(f"Subagent '{agent_id}' has no conversation log to continue.")
+    if sa.execution_mode == "acp" and sa.acp_session_id is None:
+        raise ValueError(f"ACP subagent '{agent_id}' has no session ID to continue.")
+    if sa.isolated:
+        raise ValueError(
+            f"Subagent '{agent_id}' used an isolated workspace that was cleaned up "
+            "after completion and cannot be continued."
+        )
+    try:
+        workspace = sa.workdir or Path.cwd()
+    except FileNotFoundError:
+        workspace = sa.logdir.parent
+
+    prompt_queue_closed = threading.Event()
+    start_gate = threading.Event()
+
+    def run_continuation() -> None:
+        bind_thread_generation()
+        # The registry entry is published before cached terminal state is cleared.
+        # Wait until that handoff is complete before producing a new result.
+        start_gate.wait()
+        sem = get_slot_sem()
+        sem.acquire()
+        result: ReturnType
+        completion_notified = False
+        try:
+            try:
+                if sa.execution_mode == "thread":
+                    _exec._create_subagent_thread(
+                        prompt=message,
+                        logdir=sa.logdir,
+                        model=sa.model,
+                        context_mode=sa.context_mode,
+                        context_include=sa.context_include,
+                        workspace=workspace,
+                        target="parent",
+                        output_schema=sa.output_schema,
+                        profile_name=sa.profile,
+                        agent_id=agent_id,
+                        redact_secrets=sa.redact_secrets,
+                        context_window=sa.context_window,
+                        prompt_queue_closed=prompt_queue_closed,
+                        resume=True,
+                    )
+                elif sa.execution_mode == "subprocess":
+                    process = _exec._run_subagent_subprocess(
+                        prompt=message,
+                        logdir=sa.logdir,
+                        model=sa.model,
+                        workspace=workspace,
+                        context_mode=sa.context_mode,
+                        context_include=sa.context_include,
+                        profile=sa.profile,
+                        resume=True,
+                    )
+                    with _subagents_lock:
+                        current = next(
+                            (s for s in _subagents if s.agent_id == agent_id), None
+                        )
+                    if current is None:
+                        raise RuntimeError(
+                            f"Subagent '{agent_id}' disappeared during continuation."
+                        )
+                    object.__setattr__(current, "process", process)
+                    _exec._monitor_subprocess(current)
+                    completion_notified = True
+                elif sa.execution_mode == "acp":
+                    import asyncio
+
+                    assert sa.acp_session_id is not None
+                    acp_session_id = sa.acp_session_id
+
+                    async def continue_acp() -> ReturnType:
+                        from ...acp.client import GptmeAcpClient
+
+                        collected_text: list[str] = []
+
+                        def on_update(_session_id: str, update: Any) -> None:
+                            _collect_acp_update_text(update, collected_text)
+
+                        async with GptmeAcpClient(
+                            workspace=workspace,
+                            command=sa.acp_command or "gptme-acp",
+                            auto_confirm=True,
+                            on_update=on_update,
+                        ) as client:
+                            await client.load_session(acp_session_id, cwd=workspace)
+                            response = await client.prompt(acp_session_id, message)
+                        return _acp_result(response, collected_text)
+
+                    result = asyncio.run(continue_acp())
+                else:
+                    raise ValueError(
+                        f"Unsupported subagent execution mode: {sa.execution_mode!r}"
+                    )
+            except Exception as e:
+                logger.error(f"Subagent {agent_id} continuation failed: {e}")
+                result = ReturnType("failure", str(e))
+            else:
+                if sa.execution_mode == "thread":
+                    with _subagents_lock:
+                        current = next(
+                            (s for s in _subagents if s.agent_id == agent_id), None
+                        )
+                    # This callback is still running on the continuation thread, so
+                    # status() would report "running". Read the completed log directly.
+                    result = (current or sa)._read_log()
+                elif sa.execution_mode == "subprocess":
+                    with _subagent_results_lock:
+                        result = _subagent_results.get(
+                            agent_id,
+                            ReturnType(
+                                "failure",
+                                "Subprocess continuation exited without a result.",
+                            ),
+                        )
+
+            with _subagent_results_lock:
+                _subagent_results[agent_id] = result
+            if not completion_notified:
+                notify_completion(
+                    agent_id,
+                    result.status,
+                    _exec._summarize_result(result, max_chars=200),
+                )
+        finally:
+            prompt_queue_closed.set()
+            release_thread()
+            sem.release()
+
+    thread = threading.Thread(target=run_continuation, daemon=True)
+    continued = Subagent(
+        agent_id=sa.agent_id,
+        prompt=sa.prompt,
+        thread=thread,
+        logdir=sa.logdir,
+        model=sa.model,
+        context_mode=sa.context_mode,
+        context_include=sa.context_include,
+        profile=sa.profile,
+        output_schema=sa.output_schema,
+        use_acp=sa.use_acp,
+        acp_command=sa.acp_command,
+        acp_session_id=sa.acp_session_id,
+        workdir=sa.workdir,
+        execution_mode=sa.execution_mode,
+        isolated=sa.isolated,
+        isolation_mode=sa.isolation_mode,
+        worktree_path=sa.worktree_path,
+        repo_path=sa.repo_path,
+        timeout=sa.timeout,
+        role=sa.role,
+        redact_secrets=sa.redact_secrets,
+        context_window=sa.context_window,
+        max_time=sa.max_time,
+        context_turns=sa.context_turns,
+        parent_logdir=sa.parent_logdir,
+        prompt_queue_closed=prompt_queue_closed,
+    )
+    # Re-check while replacing the registry entry: two callers can otherwise
+    # both observe the same terminal child and launch concurrent writers against
+    # one conversation log.
+    with _subagents_lock:
+        current = next((s for s in _subagents if s.agent_id == agent_id), None)
+        if current is not sa:
+            raise ValueError(
+                f"Subagent '{agent_id}' changed while continuation was starting."
+            )
+        _subagents[:] = [s for s in _subagents if s.agent_id != agent_id]
+        _subagents.append(continued)
+        # Start while holding the registry lock. A concurrent caller will then
+        # observe a live thread instead of the not-yet-started handoff object.
+        thread.start()
+    with _subagent_results_lock:
+        _subagent_results.pop(agent_id, None)
+    start_gate.set()
+    if sa.max_time is not None:
+        timer = threading.Timer(
+            sa.max_time, _timeout_subagent, args=(agent_id, sa.max_time)
+        )
+        timer.daemon = True
+        timer.start()
 
 
 def subagent_reply(agent_id: str, reply: str) -> None:

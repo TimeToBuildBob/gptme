@@ -170,6 +170,8 @@ def _create_subagent_thread(
     context_window: int | None = None,
     parent_messages: list[Message] | None = None,
     prompt_queue_closed: threading.Event | None = None,
+    *,
+    resume: bool = False,
 ) -> None:
     """Shared function for running subagent threads.
 
@@ -192,6 +194,8 @@ def _create_subagent_thread(
         prompt_queue_closed: Optional event to set immediately when chat() returns.
             Passed by run_subagent() so the event fires before the caller acquires
             _subagents_lock to find sa — closing the lock+lookup window.
+        resume: Continue the conversation already stored in ``logdir``. When true,
+            skip rebuilding startup context because the existing log owns it.
     """
     # Store agent_id in thread-local so the progress tool can identify this subagent
     if agent_id is not None:
@@ -302,8 +306,11 @@ def _create_subagent_thread(
 
     prompt_msgs = [Message("user", prompt)]
 
-    # Build initial messages based on context_mode and context_window
-    if context_window == 0:
+    # Build initial messages based on context_mode and context_window. Existing
+    # conversations already contain their startup context.
+    if resume:
+        initial_msgs = []
+    elif context_window == 0:
         # Minimal context: just agent identity and tools, no workspace files.
         # This is the context isolation mode requested by the --isolate flag.
         # Note: if context_mode="selective" is also set, context_window=0 takes
@@ -390,43 +397,44 @@ def _create_subagent_thread(
 
         initial_msgs = redact_secrets_from_messages(initial_msgs)
 
-    # Append profile system prompt if specified
-    if profile and profile.system_prompt:
-        profile_msg = Message(
+    if not resume:
+        # Append profile system prompt if specified
+        if profile and profile.system_prompt:
+            profile_msg = Message(
+                "system",
+                f"# Agent Profile: {profile.name}\n\n{profile.system_prompt}",
+            )
+            initial_msgs.append(profile_msg)
+
+        # Load and inject persistent memory for this profile
+        memory_content, memory_dir = _load_agent_memory(profile_name)
+        if memory_dir is not None:
+            memory_msg = _build_memory_system_message(memory_content, memory_dir)
+            initial_msgs.append(memory_msg)
+
+        # Inject parent conversation context if provided
+        # Redact secrets from parent messages to prevent leaking API keys/tokens
+        # that may appear in parent conversation output (e.g., shell output, env reads).
+        if parent_messages:
+            if redact_secrets:
+                from .context import redact_secrets_from_messages
+
+                parent_messages = redact_secrets_from_messages(parent_messages)
+            initial_msgs.append(_build_parent_context_message(parent_messages))
+
+        # Add completion instruction as a system message.
+        # When output_schema is set, the instruction is extended with the expected
+        # JSON schema so the subagent knows the format to use in its complete block.
+        # output_schema is intentionally NOT passed to chat() here — the LLM-level
+        # response_format (structured JSON output) conflicts with markdown tool_format
+        # because the model can't write markdown code blocks while also being forced to
+        # output raw JSON. Schema contract is enforced at the complete-block layer in
+        # Subagent._read_log() instead.
+        complete_instruction = Message(
             "system",
-            f"# Agent Profile: {profile.name}\n\n{profile.system_prompt}",
+            _get_complete_instruction(target, output_schema=output_schema),
         )
-        initial_msgs.append(profile_msg)
-
-    # Load and inject persistent memory for this profile
-    memory_content, memory_dir = _load_agent_memory(profile_name)
-    if memory_dir is not None:
-        memory_msg = _build_memory_system_message(memory_content, memory_dir)
-        initial_msgs.append(memory_msg)
-
-    # Inject parent conversation context if provided
-    # Redact secrets from parent messages to prevent leaking API keys/tokens
-    # that may appear in parent conversation output (e.g., shell output, env reads).
-    if parent_messages:
-        if redact_secrets:
-            from .context import redact_secrets_from_messages
-
-            parent_messages = redact_secrets_from_messages(parent_messages)
-        initial_msgs.append(_build_parent_context_message(parent_messages))
-
-    # Add completion instruction as a system message.
-    # When output_schema is set, the instruction is extended with the expected
-    # JSON schema so the subagent knows the format to use in its complete block.
-    # output_schema is intentionally NOT passed to chat() here — the LLM-level
-    # response_format (structured JSON output) conflicts with markdown tool_format
-    # because the model can't write markdown code blocks while also being forced to
-    # output raw JSON. Schema contract is enforced at the complete-block layer in
-    # Subagent._read_log() instead.
-    complete_instruction = Message(
-        "system",
-        _get_complete_instruction(target, output_schema=output_schema),
-    )
-    initial_msgs.append(complete_instruction)
+        initial_msgs.append(complete_instruction)
 
     # Note: workspace parameter is always passed to chat() (required parameter)
     # Workspace context in messages is controlled by initial_msgs
@@ -486,6 +494,8 @@ def _run_subagent_subprocess(
     output_schema: str | None = None,
     output_schema_dict: dict | None = None,
     profile: str | None = None,
+    *,
+    resume: bool = False,
 ) -> subprocess.Popen:
     """Run a subagent in a subprocess for output isolation.
 
@@ -509,6 +519,7 @@ def _run_subagent_subprocess(
             Injected into the prompt via ``_get_complete_instruction`` rather than
             the CLI flag, because the CLI only accepts ``module:ClassName`` format.
         profile: Agent profile name to apply via --agent-profile flag
+        resume: Continue the conversation already stored in ``logdir``.
 
     Returns:
         The subprocess.Popen object for monitoring
@@ -523,6 +534,9 @@ def _run_subagent_subprocess(
         "--no-confirm",
         f"--name={logdir.name}",  # Just the folder name, not full path
     ]
+
+    if resume:
+        cmd.append("--resume")
 
     if model:
         cmd.extend(["--model", model])
@@ -567,19 +581,21 @@ def _run_subagent_subprocess(
     if output_schema:
         cmd.extend(["--output-schema", output_schema])
 
-    # Load persistent memory and prepend to prompt for subprocess mode
-    memory_content, memory_dir = _load_agent_memory(profile)
-    if memory_dir is not None:
-        memory_section = f"\n\n[Agent Memory - stored at {memory_dir}/MEMORY.md]\n"
-        if memory_content:
-            memory_section += f"{memory_content}\n"
-        else:
-            memory_section += "No memories saved yet.\n"
-        memory_section += (
-            "You can save learnings to your memory by writing to "
-            f"{memory_dir}/MEMORY.md\n"
-        )
-        prompt = prompt + memory_section
+    # The initial run snapshots memory and completion instructions into its log.
+    # Do not duplicate them on every continuation.
+    if not resume:
+        memory_content, memory_dir = _load_agent_memory(profile)
+        if memory_dir is not None:
+            memory_section = f"\n\n[Agent Memory - stored at {memory_dir}/MEMORY.md]\n"
+            if memory_content:
+                memory_section += f"{memory_content}\n"
+            else:
+                memory_section += "No memories saved yet.\n"
+            memory_section += (
+                "You can save learnings to your memory by writing to "
+                f"{memory_dir}/MEMORY.md\n"
+            )
+            prompt = prompt + memory_section
 
     # Progress file for subprocess-mode progress delivery.
     # The subprocess writes JSON lines here; _monitor_subprocess polls and
@@ -591,11 +607,12 @@ def _run_subagent_subprocess(
     # Subprocess mode supports progress via the file channel, so enable it.
     # Pass output_schema_dict (plain-dict callers) so the schema hint is
     # injected here — the CLI --output-schema flag only accepts module:ClassName.
-    complete_section = (
-        "\n\n[Completion Instructions]\n"
-        f"{_get_complete_instruction('orchestrator', supports_progress=True, output_schema=output_schema_dict)}\n"
-    )
-    prompt = prompt + complete_section
+    if not resume:
+        complete_section = (
+            "\n\n[Completion Instructions]\n"
+            f"{_get_complete_instruction('orchestrator', supports_progress=True, output_schema=output_schema_dict)}\n"
+        )
+        prompt = prompt + complete_section
 
     # Pass prompt via stdin (piped from a temp file) instead of as a CLI argument.
     # This avoids ARG_MAX limits for large prompts and keeps argv clean.
