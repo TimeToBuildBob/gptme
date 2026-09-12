@@ -2097,6 +2097,54 @@ class TestClarifyBlock:
         assert captured["isolated"] is True
         assert captured["isolation"] == "worktree"
 
+    def test_subagent_reply_recreates_planner_executor_isolation_from_workdir(
+        self, tmp_path, monkeypatch
+    ):
+        original_workdir = tmp_path / "planner-workdir"
+        original_workdir.mkdir()
+        isolated_dir = tmp_path / "planner-isolation"
+        isolated_dir.mkdir()
+
+        cli_main = importlib.import_module("gptme.cli.main")
+        git_worktree = importlib.import_module("gptme.util.git_worktree")
+        monkeypatch.setattr(cli_main, "get_logdir", lambda name: tmp_path / name)
+        monkeypatch.setattr(git_worktree, "get_git_root", lambda workspace: None)
+        monkeypatch.setattr("tempfile.mkdtemp", lambda **kwargs: str(isolated_dir))
+        monkeypatch.setattr(
+            subagent_execution,
+            "_run_subagent_subprocess",
+            lambda **kwargs: MagicMock(),
+        )
+        monkeypatch.setattr(subagent_execution, "_monitor_subprocess", lambda sa: None)
+        monkeypatch.setattr(subagent_execution, "_cleanup_isolation", lambda sa: None)
+
+        subagent_execution._run_planner(
+            agent_id="planner",
+            prompt="coordinate",
+            subtasks=[{"id": "verify", "description": "verify it", "role": "verify"}],
+            execution_mode="sequential",
+            workdir=original_workdir,
+        )
+
+        with _subagents_lock:
+            sa = next(s for s in _subagents if s.agent_id == "planner-verify")
+        assert sa.workdir == isolated_dir
+        assert sa.base_workdir == original_workdir
+        assert sa.isolated is True
+        with _subagent_results_lock:
+            _subagent_results[sa.agent_id] = ReturnType(
+                "clarification_needed", "Which format?"
+            )
+
+        captured: dict = {}
+        monkeypatch.setattr(
+            subagent_api, "subagent", lambda **kwargs: captured.update(kwargs)
+        )
+        subagent_api.subagent_reply(sa.agent_id, "Use JSON.")
+
+        assert captured["workdir"] == original_workdir
+        assert captured["isolated"] is True
+
     def test_subagent_reply_recreates_non_git_isolation_from_original_workdir(
         self, tmp_path, monkeypatch
     ):

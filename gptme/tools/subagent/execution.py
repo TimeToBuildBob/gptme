@@ -1023,6 +1023,10 @@ def _run_planner(
             except FileNotFoundError:
                 workspace = logdir.parent
 
+        # Keep the requested workspace separate from the disposable isolated
+        # workspace so clarification replies can recreate isolation after cleanup.
+        base_workdir = workspace
+
         # Set up worktree isolation if the resolved role requires it
         worktree_path: Path | None = None
         repo_path: Path | None = None
@@ -1074,6 +1078,8 @@ def _run_planner(
                 profile=resolved_profile,
                 process=None,
                 execution_mode="subprocess",
+                workdir=workspace,
+                base_workdir=base_workdir,
                 isolated=resolved_isolated,
                 worktree_path=worktree_path,
                 repo_path=repo_path,
@@ -1158,6 +1164,8 @@ def _run_planner(
                 None,
                 logdir,
                 model,
+                workdir=workspace,
+                base_workdir=base_workdir,
                 isolated=resolved_isolated,
                 worktree_path=worktree_path,
                 repo_path=repo_path,
@@ -1221,6 +1229,8 @@ def _run_planner(
                 context_mode=context_mode,
                 context_include=context_include,
                 profile=resolved_profile,
+                workdir=workspace,
+                base_workdir=base_workdir,
                 isolated=resolved_isolated,
                 worktree_path=worktree_path,
                 repo_path=repo_path,
