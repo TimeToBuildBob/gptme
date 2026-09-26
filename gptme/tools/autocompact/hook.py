@@ -12,6 +12,7 @@ from contextlib import AbstractContextManager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from ...config import get_project_config
 from ...hooks import HookType, StopPropagation, trigger_hook
 from ...llm.models import get_default_model
 from ...message import Message, len_tokens
@@ -154,8 +155,6 @@ def autocompact_hook(
     if action == "none":
         return
 
-    _last_autocompact_attempt[conv_key] = (current_time, n_messages)
-
     if action == "rule_based":
         logger.info("Auto-compacting triggered: conversation has massive tool results")
 
@@ -233,11 +232,24 @@ def autocompact_hook(
             original_tokens = len_tokens(messages, m.model) if m else 0
             original_count = len(messages)
 
+            # Read compact_instructions and keep_recent_tokens from project config
+            compact_instructions: str | None = None
+            keep_recent_tokens: int = 20_000
+            try:
+                proj_cfg = get_project_config(manager.workspace)
+                if proj_cfg and proj_cfg.context:
+                    compact_instructions = proj_cfg.context.compact_instructions
+                    keep_recent_tokens = proj_cfg.context.keep_recent_tokens
+            except Exception:
+                pass  # Config read is best-effort; use defaults if it fails
+
             yield from _resume_via_llm(
                 manager,
                 messages,
                 use_view_branch=True,
                 llm_unlocked=llm_unlocked,
+                compact_instructions=compact_instructions,
+                keep_recent_tokens=keep_recent_tokens,
             )
             _last_autocompact_attempt[conv_key] = (
                 current_time,
