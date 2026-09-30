@@ -4583,6 +4583,16 @@ class TestDegenerationDetectorCodeScoring:
         det.feed("REPEAT REPEAT REPEAT " * 60)
         assert det.tripped
 
+    def test_carried_line_rollback_preserves_check_cadence(self):
+        det = self._make(threshold=1.0, min_content=100, check_interval=200)
+        det.feed("a" * 500)
+        checks_before = det.checks_performed
+
+        det.feed("b\n")
+
+        assert checks_before == 2
+        assert det._since_check == len("a" * 500 + "b\n") - (2 * 200)
+
 
 class TestDegenerationThresholdValidation:
     """Reject non-finite / out-of-range thresholds instead of honouring them."""
@@ -4666,7 +4676,7 @@ class TestDegenerationStreamBehaviour:
         return calls
 
     def test_aborts_without_retry_by_default(self, monkeypatch):
-        """Default: the guard aborts and records, and never opens a second stream."""
+        """Default: degeneration fails instead of returning a partial answer."""
         monkeypatch.delenv("GPTME_DEGENERATION_RETRY", raising=False)
         chunks = [
             _degen_chunk(content="REPEAT " * 60, provider="Together"),
@@ -4675,17 +4685,14 @@ class TestDegenerationStreamBehaviour:
         ]
         calls = self._setup(monkeypatch, [_openrouter_stream(chunks)])
 
-        text, metadata = _collect_stream_result(
-            llm_openai.stream([Message(role="user", content="Hi")], _OR_MODEL, None)
-        )
+        with pytest.raises(llm_openai.DegenerationDetected) as exc_info:
+            _collect_stream_result(
+                llm_openai.stream([Message(role="user", content="Hi")], _OR_MODEL, None)
+            )
 
         assert len(calls) == 1
-        assert metadata is not None
-        assert metadata["degeneration"]["provider"] == "together"
-        # Aborts are recorded, but flagged as not retried.
-        assert metadata["degeneration"]["retried"] is False
-        # Aborted, so only the already-emitted prefix was returned.
-        assert text == "REPEAT " * 60
+        assert exc_info.value.degenerate_provider == "together"
+        assert exc_info.value.score >= 0.85
 
     def test_retry_does_not_append_abandoned_output(self, monkeypatch):
         """With retry opt-in, a clean retry replaces rather than appends output."""
@@ -4723,15 +4730,14 @@ class TestDegenerationStreamBehaviour:
             ],
         )
 
-        text, metadata = _collect_stream_result(
-            llm_openai.stream([Message(role="user", content="Hi")], _OR_MODEL, None)
-        )
+        with pytest.raises(llm_openai.DegenerationDetected) as exc_info:
+            _collect_stream_result(
+                llm_openai.stream([Message(role="user", content="Hi")], _OR_MODEL, None)
+            )
 
         assert len(calls) == 2
         assert calls[1]["extra_body"]["provider"]["ignore"] == ["together"]
-        assert text == ""
-        assert metadata["degeneration"]["provider"] == "fireworks"
-        assert metadata["degeneration"]["retried"] is False
+        assert exc_info.value.degenerate_provider == "fireworks"
 
     def test_pinned_provider_is_not_retried_against_itself(self, monkeypatch):
         """A single-provider pin resolves to no alternative host: abort, no retry."""
@@ -4742,13 +4748,39 @@ class TestDegenerationStreamBehaviour:
             monkeypatch, [_openrouter_stream([degen], provider="Together")]
         )
 
-        _text, metadata = _collect_stream_result(
-            llm_openai.stream([Message(role="user", content="Hi")], pinned, None)
-        )
+        with pytest.raises(llm_openai.DegenerationDetected) as exc_info:
+            _collect_stream_result(
+                llm_openai.stream([Message(role="user", content="Hi")], pinned, None)
+            )
 
         assert len(calls) == 1
-        assert metadata["degeneration"]["provider"] == "unknown"
-        assert metadata["degeneration"]["retried"] is False
+        assert exc_info.value.degenerate_provider is None
+
+    def test_failure_after_streaming_marks_visible_output(self, monkeypatch):
+        """A late trip raises without looking atomic to higher-level retries."""
+        from gptme.llm import reply
+
+        monkeypatch.delenv("GPTME_DEGENERATION_RETRY", raising=False)
+        chunks = [
+            _degen_chunk(content="REPEAT " * 60, provider="Together"),
+            _degen_chunk(content="REPEAT " * 60, provider="Together"),
+        ]
+        self._setup(monkeypatch, [_openrouter_stream(chunks)])
+
+        with pytest.raises(llm_openai.DegenerationDetected) as exc_info:
+            reply(
+                [Message(role="user", content="Hi")],
+                _OR_MODEL,
+                stream=True,
+                tools=None,
+                on_token=lambda _text: None,
+            )
+
+        assert getattr(exc_info.value, "_gptme_llm_reply_output_emitted", False) is True
+        assert (
+            getattr(exc_info.value, "_gptme_llm_reply_visible_output_emitted", False)
+            is True
+        )
 
     def test_code_only_stream_still_emits_before_completion(self, monkeypatch):
         """Withholding is capped so code-heavy replies keep streaming."""

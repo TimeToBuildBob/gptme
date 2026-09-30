@@ -148,8 +148,8 @@ _DEGEN_CHECK_INTERVAL = 200
 _DEGEN_WITHHOLD_MAX = 8192
 
 
-class DegenerationDetected(Exception):
-    """Raised mid-stream when repetition exceeds the configured threshold."""
+class DegenerationDetected(RuntimeError):
+    """Raised when repetition invalidates a streamed response."""
 
     def __init__(self, provider: str | None, score: float) -> None:
         self.degenerate_provider = provider
@@ -205,6 +205,7 @@ class _RepetitionDetector:
         self._in_code = False
         self._line_carry = ""
         self._carry_counted_len = 0
+        self._carry_counted_since_check = 0
         self._fence_re = re.compile(r"^[ \t]*```")
 
         self._consecutive = 0
@@ -254,12 +255,15 @@ class _RepetitionDetector:
         fragment is counted provisionally and rolled back when it completes, so
         a stream that never sends a final newline is still scored.
         """
-        # Roll back the provisionally counted trailing fragment.
+        # Roll back the provisionally counted trailing fragment.  Only the
+        # fragment chars still pending toward the next check belong in
+        # ``_since_check``; earlier checks may already have consumed the rest.
         if self._carry_counted_len:
             self._clean_len -= self._carry_counted_len
-            self._since_check -= self._carry_counted_len
+            self._since_check -= self._carry_counted_since_check
             self._drop_buffer_tail(self._carry_counted_len)
             self._carry_counted_len = 0
+            self._carry_counted_since_check = 0
 
         combined = self._line_carry + text
         self._line_carry = ""
@@ -279,6 +283,9 @@ class _RepetitionDetector:
         if self._line_carry and not self._in_code:
             self._append_buffer(self._line_carry)
             self._carry_counted_len = len(self._line_carry)
+            self._carry_counted_since_check = min(
+                self._carry_counted_len, self._since_check
+            )
 
     # ------------------------------------------------------------------
     def _append_buffer(self, text: str) -> None:
@@ -2318,24 +2325,18 @@ def stream(
             captured_metadata = None
             served_model = None
         else:
-            if _degen_emitted:
-                _reason = "output already emitted to the caller"
-            else:
-                _reason = "no alternative subprovider available"
             logger.warning(
                 "Degeneration detected mid-stream (score=%.2f, provider=%r); "
-                "aborting stream (%s). Set %s=1 to allow a clean retry.",
+                "failing response. Set %s=1 to allow a clean retry.",
                 detector.score,
                 _raw_or_provider,
-                _reason,
                 _ENV_DEGEN_RETRY,
             )
-            # Emit whatever was withheld so the caller still gets a response.
-            if _degen_pending:
-                _degen_emitted = True
-                yield from _degen_pending
-                _degen_pending.clear()
-            break
+            # A partial answer is not a successful assistant response: callers
+            # must not persist it or execute a truncated tool call.  If output
+            # was already streamed, the raised exception is tagged by the caller
+            # so higher-level retry logic cannot append another response.
+            raise DegenerationDetected(_raw_or_provider, detector.score)
 
     if captured_metadata is None and (
         reasoning_effort is not None or served_model is not None
