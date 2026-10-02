@@ -3512,6 +3512,97 @@ class TestOpenAIStreamMalformedChunk:
             next(gen)
         assert isinstance(excinfo.value.__cause__, IndexError)
 
+    def test_retry_decorator_retries_plain_apierror_from_stream(self):
+        """Integration: APIError from the stream passes through _guarded_stream_iter
+        and is retried by retry_generator_on_openai_error.
+
+        The existing unit tests call _handle_openai_transient_error directly.
+        This test exercises the full path: stream raises APIError → _guarded_stream_iter
+        re-raises it (it's an OpenAIError) → retry decorator catches it and retries.
+        Regression guard for the combination of the two mechanisms.
+        """
+        from unittest.mock import patch
+
+        import httpx
+        from openai import APIError
+
+        from gptme.llm.llm_openai import (
+            _guarded_stream_iter,
+            retry_generator_on_openai_error,
+        )
+
+        request = httpx.Request("POST", "https://example.test/v1/chat")
+        error = APIError("Overloaded", request=request, body={"code": 502})
+
+        @retry_generator_on_openai_error(max_retries=3, base_delay=0.0)
+        def fake_stream():
+            yield from _guarded_stream_iter(
+                self._raising_stream(error),
+                model="openrouter/test/model",
+                provider="openrouter",
+            )
+
+        with (
+            patch("gptme.llm.llm_openai.backoff_wait", return_value=False) as mock_wait,
+            pytest.raises(APIError),
+        ):
+            list(fake_stream())
+
+        # At least one retry must have been attempted (GPTME_TEST_MAX_RETRIES may cap the exact count)
+        assert mock_wait.call_count >= 1
+
+    def test_retry_decorator_does_not_retry_plain_apierror_after_output(self):
+        """After content has been yielded, APIError is not retried.
+
+        This is the 'after output' invariant: retrying after streaming starts
+        would send duplicate output to the user.
+        """
+        from unittest.mock import patch
+
+        import httpx
+        from openai import APIError
+
+        from gptme.llm.llm_openai import (
+            _guarded_stream_iter,
+            retry_generator_on_openai_error,
+        )
+
+        request = httpx.Request("POST", "https://example.test/v1/chat")
+        error = APIError("Overloaded", request=request, body={"code": 502})
+
+        class _StreamOneChunkThenError:
+            """Yield one chunk, then raise APIError on the next next() call."""
+
+            def __init__(self):
+                self._called = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self._called == 0:
+                    self._called += 1
+                    return "chunk"
+                raise error
+
+        @retry_generator_on_openai_error(max_retries=3, base_delay=0.0)
+        def fake_stream():
+            yield from _guarded_stream_iter(
+                _StreamOneChunkThenError(),
+                model="openrouter/test/model",
+                provider="openrouter",
+            )
+
+        with patch(
+            "gptme.llm.llm_openai.backoff_wait", return_value=False
+        ) as mock_wait:
+            gen = fake_stream()
+            assert next(gen) == "chunk"  # first chunk succeeds
+            with pytest.raises(APIError):
+                next(gen)  # error after output — must not retry
+
+        mock_wait.assert_not_called()
+
 
 class TestRecordUsageCacheTokens:
     """Tests for _record_usage cache token extraction.
