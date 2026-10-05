@@ -498,11 +498,6 @@ def _stream_responses_events(
                 if served is not None:
                     model_callback(served)
 
-        elif event_type in ("error", "response.failed"):
-            # Without this a failed response ended the stream silently and
-            # looked like a normal (often empty) reply.
-            raise _responses_stream_error(event)
-
         elif event_type in (
             "response.completed",
             "response.done",
@@ -535,29 +530,6 @@ def _stream_responses_events(
         yield pending.replace("<thinking>", "<think>").replace(
             "</thinking>", "</think>"
         )
-
-
-def _responses_stream_error(event: Any) -> Exception:
-    """Build a provider error from an ``error``/``response.failed`` stream event.
-
-    ``error`` events carry ``code``/``message`` at the top level;
-    ``response.failed`` nests them under ``response.error``. Raising an
-    ``openai.APIError`` with that body lets ``is_provider_error()`` and
-    ``is_context_length_error()`` classify it like any other provider failure.
-    """
-    import httpx
-    from openai import APIError  # fmt: skip
-
-    error = _obj_get(_obj_get(event, "response", None), "error", None) or event
-    code = _obj_get(error, "code", None)
-    message = _obj_get(error, "message", None) or "unknown error"
-    body = {"code": code, "message": message}
-    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
-    return APIError(
-        f"Responses API stream failed ({code or 'no code'}): {message}",
-        request,
-        body=body,
-    )
 
 
 def _extract_usage_token_counts(usage: Any) -> UsageTokenCounts:
