@@ -934,7 +934,10 @@ def test_claude_5_chat_wire_payload(model, reasoning, monkeypatch):
     monkeypatch.setattr(llm_anthropic, "_is_proxy", False)
     monkeypatch.setattr(llm_anthropic, "_HAS_OUTPUT_CONFIG", True)
     with httpx.Client(transport=httpx.MockTransport(serve)) as http_client:
-        client = Anthropic(api_key="test-key", http_client=http_client)
+        # Pass a non-default timeout so the SDK's streaming enforcement
+        # (which fires when timeout==DEFAULT_TIMEOUT and max_tokens is large)
+        # is not triggered for the mock transport.
+        client = Anthropic(api_key="test-key", http_client=http_client, timeout=30)
         monkeypatch.setattr(llm_anthropic, "_anthropic", client)
         answer, _ = llm_anthropic.chat(
             [Message("system", "Be helpful."), Message("user", "Hello")],
