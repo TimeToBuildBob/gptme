@@ -5960,6 +5960,21 @@ def test_v2_config_patch_rebuild_uses_model_default_tool_format(
     way ``session_step`` does — otherwise the system prompt advertises markdown
     while the step parser expects native tool calls.
     """
+    from gptme.config import Config
+
+    # Isolate the model-default fallback from a developer's TOOL_FORMAT env
+    # setting: a valid override would win over the model default and make this
+    # test fail on machines that have it configured.
+    original_get_env = Config.get_env
+
+    def get_env(self, key, default=None):
+        if key == "TOOL_FORMAT":
+            return None
+        return original_get_env(self, key, default)
+
+    monkeypatch.setattr(Config, "get_env", get_env)
+    monkeypatch.delenv("GPTME_TOOL_FORMAT", raising=False)
+
     meta = ModelMeta(
         provider="openai",
         model="gpt-4o",
