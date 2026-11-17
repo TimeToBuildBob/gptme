@@ -264,7 +264,11 @@ def preserved_notice(preserved: str) -> str:
 
 
 def update_subagent_result_with_branch(
-    agent_id: str, branch: str, has_output_schema: bool = False
+    agent_id: str,
+    branch: str,
+    has_output_schema: bool = False,
+    *,
+    attempt: "Subagent | None" = None,
 ) -> None:
     """Amend a cached result to include a preserved branch name.
 
@@ -275,10 +279,30 @@ def update_subagent_result_with_branch(
     When ``has_output_schema`` is True, the cached result string is JSON that
     callers parse — appending human-readable text would break that parse, so
     the branch is logged only (via ``_cleanup_isolation``) and not patched in.
+
+    A shadowed ``attempt`` does not own the shared slot (another conversation's
+    run does, gptme/gptme#4990): its own outcome is amended instead.
     """
     if has_output_schema:
         return
     suffix = preserved_notice(branch)
+    if attempt is not None and attempt.shadowed:
+        from .persistence import persist_subagent_outcome
+
+        with _outcome_persist_lock:
+            with _subagents_lock:
+                own = attempt.shadowed_outcome
+                if not attempt.shadowed or own is None:
+                    return
+                if isinstance(own.result, str):
+                    own = replace(own, result=own.result + suffix)
+                elif own.result is None:
+                    own = replace(own, result=suffix.lstrip("\n"))
+                else:
+                    return  # structured (dict) result — cannot amend inline
+                object.__setattr__(attempt, "shadowed_outcome", own)
+            persist_subagent_outcome(attempt, own)
+        return
     with _subagent_results_lock:
         existing = _subagent_results.get(agent_id)
         if existing is None:
@@ -758,8 +782,21 @@ class Subagent:
                     self, "shadowed_outcome", load_subagent_outcome(self)
                 )
             return self.shadowed_outcome
-        with _subagent_results_lock:
-            return _subagent_results.get(self.agent_id)
+        with _subagents_lock:
+            holder = next(
+                (s for s in reversed(_subagents) if s.agent_id == self.agent_id),
+                None,
+            )
+            if (
+                holder is not None
+                and holder is not self
+                and holder.parent_logdir != self.parent_logdir
+            ):
+                # Another conversation's concurrent run holds the agent_id slot
+                # (gptme/gptme#4990); this run has published nothing there yet.
+                return None
+            with _subagent_results_lock:
+                return _subagent_results.get(self.agent_id)
 
     def status(self) -> ReturnType:
         cached_result = self._cached_result()
