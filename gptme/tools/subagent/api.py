@@ -263,13 +263,25 @@ def _write_cancel_op(logdir: Path, agent_id: str) -> None:
 
 
 def _wait_for_cached_subagent_result(
-    agent_id: str, timeout: float = 0.5, poll_interval: float = 0.005
+    agent_id: str,
+    timeout: float = 0.5,
+    poll_interval: float = 0.005,
+    sa: "Subagent | None" = None,
 ) -> ReturnType | None:
-    """Briefly wait for a concurrent watchdog/cancel result to hit the cache."""
+    """Briefly wait for a concurrent watchdog/cancel result to hit the cache.
+
+    When *sa* is provided, checks ``sa._cached_result()`` rather than the global
+    agent_id cache — this ensures an owner-scoped result (e.g., a shadowed
+    subprocess that published its own outcome) is found without reading another
+    conversation's cached result.
+    """
     deadline = time.monotonic() + timeout
     while True:
-        with _subagent_results_lock:
-            cached_result = _subagent_results.get(agent_id)
+        if sa is not None:
+            cached_result = sa._cached_result()
+        else:
+            with _subagent_results_lock:
+                cached_result = _subagent_results.get(agent_id)
         if cached_result is not None:
             return cached_result
 
@@ -1443,14 +1455,32 @@ def subagent_cancel(agent_id: str) -> str:
         # can never observe the cancel op without a "cancelled" result already in
         # the cache — preventing a race where the hook's set_subagent_result_if_absent
         # would win with the wrong status.
-        if not set_subagent_result_if_absent(agent_id, cancelled_result, attempt=sa):
+        # owner_logdir lets the owner cancel its child even when another conversation
+        # holds the global agent_id namespace (skips the global-holder identity check).
+        if not set_subagent_result_if_absent(
+            agent_id, cancelled_result, attempt=sa, owner_logdir=owner
+        ):
             return f"Subagent '{agent_id}' already finished before cancellation."
         with _subagents_lock:
-            current = next(
-                (s for s in reversed(_subagents) if s.agent_id == agent_id), None
-            )
-            if current is not sa:
-                return f"Subagent '{agent_id}' changed before cancellation."
+            # Owner-scoped check: when owner is set, verify the owner's current
+            # child hasn't changed (not the global newest holder).
+            if owner is not None and sa.parent_logdir == owner:
+                owner_current = next(
+                    (
+                        s
+                        for s in reversed(list(_subagents) + list(_shadowed_subagents))
+                        if s.agent_id == agent_id and s.parent_logdir == owner
+                    ),
+                    None,
+                )
+                if owner_current is not None and owner_current is not sa:
+                    return f"Subagent '{agent_id}' changed before cancellation."
+            else:
+                current = next(
+                    (s for s in reversed(_subagents) if s.agent_id == agent_id), None
+                )
+                if current is not sa:
+                    return f"Subagent '{agent_id}' changed before cancellation."
             try:
                 append_control_op(sa.logdir, "cancel", agent_id=agent_id)
             except OSError as e:
@@ -1467,16 +1497,30 @@ def subagent_cancel(agent_id: str) -> str:
     if sa.execution_mode == "thread":
         # Thread mode: mark result BEFORE writing the control file (same race fix).
         # The thread stops at its next STEP_PRE checkpoint and releases the slot.
-        if not set_subagent_result_if_absent(agent_id, cancelled_result, attempt=sa):
+        if not set_subagent_result_if_absent(
+            agent_id, cancelled_result, attempt=sa, owner_logdir=owner
+        ):
             return f"Subagent '{agent_id}' already finished before cancellation."
         # Serialize the enqueue with continuation's queue cleanup/publication.
         # Result persistence above can yield after the old child has stopped.
         with _subagents_lock:
-            current = next(
-                (s for s in reversed(_subagents) if s.agent_id == agent_id), None
-            )
-            if current is not sa:
-                return f"Subagent '{agent_id}' changed before cancellation."
+            if owner is not None and sa.parent_logdir == owner:
+                owner_current = next(
+                    (
+                        s
+                        for s in reversed(list(_subagents) + list(_shadowed_subagents))
+                        if s.agent_id == agent_id and s.parent_logdir == owner
+                    ),
+                    None,
+                )
+                if owner_current is not None and owner_current is not sa:
+                    return f"Subagent '{agent_id}' changed before cancellation."
+            else:
+                current = next(
+                    (s for s in reversed(_subagents) if s.agent_id == agent_id), None
+                )
+                if current is not sa:
+                    return f"Subagent '{agent_id}' changed before cancellation."
             try:
                 append_control_op(sa.logdir, "cancel", agent_id=agent_id)
             except OSError as e:
@@ -1497,7 +1541,9 @@ def subagent_cancel(agent_id: str) -> str:
             "The background thread will stop at its next cooperative checkpoint."
         )
     # ACP mode: threads cannot be stopped; keep cache-mark-only behavior.
-    if not set_subagent_result_if_absent(agent_id, cancelled_result, attempt=sa):
+    if not set_subagent_result_if_absent(
+        agent_id, cancelled_result, attempt=sa, owner_logdir=owner
+    ):
         return f"Subagent '{agent_id}' already finished before cancellation."
     logger.info(
         f"Subagent '{agent_id}' (ACP) marked cancelled (no cooperative checkpoint)."
@@ -2065,13 +2111,30 @@ def subagent_continue(
         # both observe the same terminal child and launch concurrent writers against
         # one conversation log.
         with _subagents_lock:
-            current = next(
-                (s for s in reversed(_subagents) if s.agent_id == agent_id), None
-            )
-            if current is not sa:
-                raise ValueError(
-                    f"Subagent '{agent_id}' changed while continuation was starting."
+            if owner is not None and sa.parent_logdir == owner:
+                # Owner-scoped check: allow continuation of a shadowed or disk-loaded
+                # child even when a different conversation holds the global agent_id
+                # slot.  Guard against concurrent continuations from the same owner.
+                owner_current = next(
+                    (
+                        s
+                        for s in reversed(list(_subagents) + list(_shadowed_subagents))
+                        if s.agent_id == agent_id and s.parent_logdir == owner
+                    ),
+                    None,
                 )
+                if owner_current is not None and owner_current is not sa:
+                    raise ValueError(
+                        f"Subagent '{agent_id}' changed while continuation was starting."
+                    )
+            else:
+                current = next(
+                    (s for s in reversed(_subagents) if s.agent_id == agent_id), None
+                )
+                if current is not sa:
+                    raise ValueError(
+                        f"Subagent '{agent_id}' changed while continuation was starting."
+                    )
             # The previous attempt has stopped (and, for subprocesses, we hold its
             # writer lease), so any cancel still queued in control.jsonl was
             # addressed to it and never drained. Fence it off before the new
@@ -2089,16 +2152,45 @@ def subagent_continue(
                     f"Subagent '{agent_id}' has an unreadable control file; "
                     f"cannot clear stale cancellation before continuing: {e}"
                 ) from e
-            _subagents[:] = [s for s in _subagents if s.agent_id != agent_id]
-            _subagents.append(continued)
+            if owner is not None and sa.parent_logdir == owner:
+                # Remove only this owner's entries so other conversations' holders
+                # are preserved — sa may be in _subagents or _shadowed_subagents.
+                _subagents[:] = [
+                    s
+                    for s in _subagents
+                    if not (s.agent_id == agent_id and s.parent_logdir == owner)
+                ]
+                _shadowed_subagents[:] = [
+                    s
+                    for s in _shadowed_subagents
+                    if not (s.agent_id == agent_id and s.parent_logdir == owner)
+                ]
+                # Register the continuation: take the global holder slot if free,
+                # otherwise become a shadowed entry so result reads use
+                # shadowed_outcome rather than the other conversation's global cache.
+                global_holder = next(
+                    (s for s in reversed(_subagents) if s.agent_id == agent_id), None
+                )
+                if global_holder is None:
+                    _subagents.append(continued)
+                else:
+                    object.__setattr__(continued, "shadowed", True)
+                    _shadowed_subagents.append(continued)
+            else:
+                _subagents[:] = [s for s in _subagents if s.agent_id != agent_id]
+                _subagents.append(continued)
             persist_subagent_meta(continued)
             # Start while holding the registry lock. A concurrent caller will then
             # observe a live thread instead of the not-yet-started handoff object.
             thread.start()
-            # Restoration checks registry identity under this same lock, so it
-            # cannot insert the previous attempt's result after this handoff.
+            # Clear the global result cache only when this owner's continuation is
+            # the new global holder; don't pop another conversation's cached result.
             with _subagent_results_lock:
-                _subagent_results.pop(agent_id, None)
+                new_global = next(
+                    (s for s in reversed(_subagents) if s.agent_id == agent_id), None
+                )
+                if new_global is continued:
+                    _subagent_results.pop(agent_id, None)
     except BaseException:
         # The worker never took ownership of the lease; do not strand it.
         if writer_lease is not None:
@@ -2497,8 +2589,11 @@ def subagent_wait(
         # Thread mode: join thread
         sa.thread.join(timeout=timeout)
 
+    # Pass sa so the cache poll checks sa._cached_result() rather than the
+    # global agent_id dict, preventing a cross-conversation result leak when
+    # a different conversation's run holds the same agent_id namespace.
     cached_status = (
-        _wait_for_cached_subagent_result(agent_id) if sa.is_running() else None
+        _wait_for_cached_subagent_result(agent_id, sa=sa) if sa.is_running() else None
     )
     status = cached_status if cached_status is not None else sa.status()
     result_dict = asdict(status)

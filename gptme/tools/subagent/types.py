@@ -180,7 +180,11 @@ def _persist_cached_outcome(agent_id: str) -> None:
 
 
 def set_subagent_result_if_absent(
-    agent_id: str, result: "ReturnType", *, attempt: "Subagent | None" = None
+    agent_id: str,
+    result: "ReturnType",
+    *,
+    attempt: "Subagent | None" = None,
+    owner_logdir: "Path | None" = None,
 ) -> bool:
     """Cache a subagent result unless another terminal result already exists.
 
@@ -192,14 +196,27 @@ def set_subagent_result_if_absent(
     otherwise cache the OLD outcome for the resumed attempt. The identity check
     shares continuation's lock order (registry, then results). An unregistered
     attempt is not superseded and publishes normally.
+
+    When *owner_logdir* is provided and ``attempt.parent_logdir`` matches, the
+    global-holder identity check is skipped so a conversation can write its
+    child's terminal result even when a different conversation's run holds the
+    agent_id namespace.  The result is still written to the global agent_id cache
+    (which is unique within any one conversation's lifetime).
     """
     with _subagents_lock:
         if attempt is not None:
-            current = next(
-                (s for s in reversed(_subagents) if s.agent_id == agent_id), None
+            owner_matches = (
+                owner_logdir is not None
+                and attempt.parent_logdir is not None
+                and Path(attempt.parent_logdir).resolve()
+                == Path(owner_logdir).resolve()
             )
-            if current is not None and current is not attempt:
-                return False
+            if not owner_matches:
+                current = next(
+                    (s for s in reversed(_subagents) if s.agent_id == agent_id), None
+                )
+                if current is not None and current is not attempt:
+                    return False
         with _subagent_results_lock:
             if agent_id in _subagent_results:
                 return False
