@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import stat
+import threading
 import uuid
 from collections.abc import Iterator, MutableMapping
 from contextlib import contextmanager
@@ -1014,15 +1015,24 @@ def _is_private_config(path: Path) -> bool:
     return path.name == USER_CONFIG_SOURCE_LOCAL
 
 
+# Config locks the current thread already holds, so a nested acquisition (a
+# first-run create inside set_config_value) does not deadlock on its own flock.
+_held_config_locks = threading.local()
+
+
 @contextmanager
 def _config_write_lock(path: str | Path) -> Iterator[None]:
     """Serialize read-modify-write cycles on one config file across processes.
 
     The lock is a sidecar next to the resolved file, so every name for the same
-    config (e.g. a dotfiles symlink) shares it. Not re-entrant: never reload the
-    config while holding it, since a reload may take it again.
+    config (e.g. a dotfiles symlink) shares it. Re-entrant within one thread;
+    other threads and processes wait.
     """
     target = Path(path).resolve()
+    held: set[str] = _held_config_locks.__dict__.setdefault("paths", set())
+    if str(target) in held:
+        yield
+        return
     target.parent.mkdir(parents=True, exist_ok=True)
     lock_path = target.with_name(f".{target.name}.lock")
     with lock_path.open("a+b") as lock_file:
@@ -1031,14 +1041,41 @@ def _config_write_lock(path: str | Path) -> Iterator[None]:
         elif msvcrt is not None:  # pragma: no cover - Windows
             lock_file.seek(0)
             msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        held.add(str(target))
         try:
             yield
         finally:
+            held.discard(str(target))
             if fcntl is not None:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
             elif msvcrt is not None:  # pragma: no cover - Windows
                 lock_file.seek(0)
                 msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def _publish_over_placeholder(staged: Path, target: Path) -> None:
+    """Exclusively create ``target`` from ``staged`` without hard links.
+
+    Call with the target's write lock held. Raises `FileExistsError` if the
+    target exists. If publishing fails, the empty placeholder is removed: the
+    next launch would otherwise take it as an existing config and skip writing
+    the defaults.
+    """
+    os.close(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    placeholder = os.stat(target)
+    try:
+        os.replace(staged, target)
+    except BaseException:
+        try:
+            current = os.stat(target)
+            if (current.st_dev, current.st_ino) == (
+                placeholder.st_dev,
+                placeholder.st_ino,
+            ):
+                os.unlink(target)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _write_config_text(path: str | Path, text: str, *, exclusive: bool = False) -> bool:
@@ -1101,28 +1138,10 @@ def _write_config_text(path: str | Path, text: str, *, exclusive: bool = False) 
                         # Claim the name with an empty placeholder, which fails
                         # if the file appeared meanwhile, then replace our own
                         # placeholder. Readers only ever see empty or complete
-                        # TOML. The config lock is not re-entrant and callers
-                        # may hold it, so it cannot be taken here.
-                        os.close(
-                            os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                        )
-                        placeholder = os.stat(target)
-                        try:
-                            os.replace(staged, target)
-                        except BaseException:
-                            # Never leave our empty placeholder behind: the next
-                            # launch would take it as an existing config and
-                            # skip writing the defaults.
-                            try:
-                                current = os.stat(target)
-                                if (current.st_dev, current.st_ino) == (
-                                    placeholder.st_dev,
-                                    placeholder.st_ino,
-                                ):
-                                    os.unlink(target)
-                            except FileNotFoundError:
-                                pass
-                            raise
+                        # TOML. The write lock keeps a concurrent save from
+                        # landing between the cleanup check and the unlink.
+                        with _config_write_lock(target):
+                            _publish_over_placeholder(staged, target)
                 else:  # pragma: no cover - rename refuses existing targets there
                     os.rename(staged, target)
             except FileExistsError:

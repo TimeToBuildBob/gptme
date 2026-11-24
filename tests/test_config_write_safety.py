@@ -209,7 +209,9 @@ def test_first_run_create_does_not_replace_concurrent_save(tmp_path: Path) -> No
     path.write_text('[models]\ndefault = "theirs"\n', encoding="utf-8")
     assert not user_mod._write_config_text(path, "[env]\n", exclusive=True)
     assert "theirs" in path.read_text(encoding="utf-8")
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["config.toml"]
+    # A lock sidecar is expected; no staged or placeholder file is left.
+    left = [p.name for p in tmp_path.iterdir() if not p.name.endswith(".lock")]
+    assert left == ["config.toml"]
 
 
 def test_onboard_updates_local_default_when_it_wins(config_file: Path) -> None:
@@ -273,7 +275,9 @@ def test_first_run_create_without_hard_links(tmp_path: Path, existing: bool) -> 
     assert created is not existing
     expected = "theirs" if existing else "[env]"
     assert expected in path.read_text(encoding="utf-8")
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["config.toml"]
+    # A lock sidecar is expected; no staged or placeholder file is left.
+    left = [p.name for p in tmp_path.iterdir() if not p.name.endswith(".lock")]
+    assert left == ["config.toml"]
 
 
 @posix_only
@@ -317,4 +321,41 @@ def test_first_run_create_failed_publish_leaves_no_placeholder(
     ):
         user_mod._write_config_text(path, "[env]\n", exclusive=True)
 
-    assert list(tmp_path.iterdir()) == []
+    assert [p for p in tmp_path.iterdir() if not p.name.endswith(".lock")] == []
+
+
+def test_first_run_cleanup_holds_the_write_lock(tmp_path: Path) -> None:
+    """A concurrent save cannot land between the cleanup check and the unlink."""
+    import threading
+
+    path = tmp_path / "config.toml"
+    other_writer_got_lock = threading.Event()
+
+    def other_writer() -> None:
+        with user_mod._config_write_lock(path):
+            other_writer_got_lock.set()
+
+    def no_links(src, dst):
+        raise PermissionError(1, "Operation not permitted")
+
+    def replace_fails_while_another_writer_waits(src, dst):
+        writer = threading.Thread(target=other_writer)
+        writer.start()
+        assert not other_writer_got_lock.wait(0.3)
+        raise OSError(5, "Input/output error")
+
+    with (
+        patch.object(user_mod.os, "link", no_links),
+        patch.object(user_mod.os, "replace", replace_fails_while_another_writer_waits),
+        pytest.raises(OSError, match="Input/output error"),
+    ):
+        user_mod._write_config_text(path, "[env]\n", exclusive=True)
+
+    assert other_writer_got_lock.wait(5)
+    assert not path.exists()
+
+
+def test_config_write_lock_is_reentrant_in_one_thread(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    with user_mod._config_write_lock(path), user_mod._config_write_lock(path):
+        pass

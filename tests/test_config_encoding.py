@@ -10,6 +10,7 @@ are exactly the ones a user writes about themselves: `[user] about`,
 
 import builtins
 import codecs
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -531,14 +532,14 @@ def backup_writes_failing():
     under a temporary name and renamed — a probe that only fails on `.orig` would
     silently miss the write and report a pass.
     """
-    real_write_bytes = Path.write_bytes
+    real_open = os.open
 
-    def shim(self, data):
-        if ".orig" in str(self):
+    def shim(path, flags, *args, **kwargs):
+        if ".orig" in str(path):
             raise OSError(28, "No space left on device")
-        return real_write_bytes(self, data)
+        return real_open(path, flags, *args, **kwargs)
 
-    with patch.object(Path, "write_bytes", shim):
+    with patch.object(user_mod.os, "open", shim):
         yield
 
 
