@@ -13,14 +13,17 @@ from pathlib import Path
 from typing import cast
 
 import click
-import tomlkit
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from ..config import config_path, get_config, set_config_value
-from ..config.user import get_user_config_paths
+from ..config.user import (
+    USER_CONFIG_SOURCE_LOCAL,
+    get_default_model_source,
+    get_user_config_paths,
+)
 from ..llm import list_available_providers
 from ..llm.models import MODELS, PROVIDERS, BuiltinProvider, get_recommended_model
 from ..llm.validate import OAUTH_PROVIDERS, PROVIDER_DOCS, validate_api_key
@@ -268,13 +271,9 @@ def _create_config(provider: str, model: str | None = None) -> Path:
             return conf_path
 
     # config.local.toml overrides config.toml, so update it if it sets one.
+    # Use the startup loader, which also accepts legacy-encoded files.
     _, local_path = get_user_config_paths()
-    try:
-        local_doc = tomlkit.parse(local_path.read_text(encoding="utf-8"))
-    except (OSError, tomlkit.exceptions.TOMLKitError):
-        local_doc = tomlkit.document()
-    models = local_doc.get("models")
-    in_local = isinstance(models, dict) and "default" in models
+    in_local = get_default_model_source() == USER_CONFIG_SOURCE_LOCAL
     if in_local:
         conf_path = local_path
     set_config_value("models.default", model, local=in_local)

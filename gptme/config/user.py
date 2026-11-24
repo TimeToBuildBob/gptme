@@ -1078,8 +1078,20 @@ def _write_config_text(path: str | Path, text: str, *, exclusive: bool = False) 
             # process created after our existence check.
             try:
                 if hasattr(os, "link"):
-                    os.link(staged, target)
-                    staged.unlink()
+                    try:
+                        os.link(staged, target)
+                        staged.unlink()
+                    except FileExistsError:
+                        raise
+                    except OSError:
+                        # No hard links here (exFAT, some network mounts).
+                        # Claim the name with an empty placeholder, which fails
+                        # if the file appeared meanwhile, then replace our own
+                        # placeholder. Readers only ever see empty or complete
+                        # TOML. The config lock is not re-entrant and callers
+                        # may hold it, so it cannot be taken here.
+                        os.close(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL))
+                        os.replace(staged, target)
                 else:  # pragma: no cover - rename refuses existing targets there
                     os.rename(staged, target)
             except FileExistsError:

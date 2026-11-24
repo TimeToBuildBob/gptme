@@ -232,3 +232,45 @@ def test_onboard_updates_local_default_when_it_wins(config_file: Path) -> None:
         onboard._create_config("openai", "openai/new")
 
     assert load_user_config(str(config_file)).models.default == "openai/new"
+
+
+def test_onboard_reads_legacy_encoded_local_config(config_file: Path) -> None:
+    """A config.local.toml gptme can load (non-UTF-8) must not crash onboarding."""
+    from gptme.cli import onboard
+
+    local = config_file.with_name("config.local.toml")
+    local.write_bytes('# café\n[models]\ndefault = "anthropic/old"\n'.encode("cp1252"))
+    with (
+        patch.object(onboard, "config_path", str(config_file)),
+        patch.object(
+            onboard,
+            "get_config",
+            return_value=SimpleNamespace(
+                user=SimpleNamespace(models=SimpleNamespace(default="anthropic/old"))
+            ),
+        ),
+        patch.object(onboard.Confirm, "ask", return_value=True),
+        patch("gptme.config.core.reload_config"),
+    ):
+        assert onboard._create_config("openai", "openai/new") == local
+
+    assert load_user_config(str(config_file)).models.default == "openai/new"
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_first_run_create_without_hard_links(tmp_path: Path, existing: bool) -> None:
+    """Exclusive create still works (and still refuses to replace) without os.link."""
+    path = tmp_path / "config.toml"
+    if existing:
+        path.write_text('[models]\ndefault = "theirs"\n', encoding="utf-8")
+
+    def no_links(src, dst):
+        raise PermissionError(1, "Operation not permitted")
+
+    with patch.object(user_mod.os, "link", no_links):
+        created = user_mod._write_config_text(path, "[env]\n", exclusive=True)
+
+    assert created is not existing
+    expected = "theirs" if existing else "[env]"
+    assert expected in path.read_text(encoding="utf-8")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["config.toml"]
