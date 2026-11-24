@@ -188,3 +188,47 @@ def test_onboard_keeps_existing_default_when_declined(config_file: Path) -> None
         onboard._create_config("openai", "openai/y")
 
     save.assert_not_called()
+
+
+@posix_only
+def test_symlinked_local_config_with_other_target_name_is_private(
+    config_file: Path,
+) -> None:
+    target = config_file.parent / "secrets.toml"
+    target.write_text("[env]\n", encoding="utf-8")
+    target.chmod(0o644)
+    config_file.with_name("config.local.toml").symlink_to(target)
+
+    set_config_value("env.KEY", "secret", reload=False, local=True)
+
+    assert _mode(target) == 0o600
+
+
+def test_first_run_create_does_not_replace_concurrent_save(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[models]\ndefault = "theirs"\n', encoding="utf-8")
+    assert not user_mod._write_config_text(path, "[env]\n", exclusive=True)
+    assert "theirs" in path.read_text(encoding="utf-8")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["config.toml"]
+
+
+def test_onboard_updates_local_default_when_it_wins(config_file: Path) -> None:
+    from gptme.cli import onboard
+
+    local = config_file.with_name("config.local.toml")
+    local.write_text('[models]\ndefault = "anthropic/old"\n', encoding="utf-8")
+    with (
+        patch.object(onboard, "config_path", str(config_file)),
+        patch.object(
+            onboard,
+            "get_config",
+            return_value=SimpleNamespace(
+                user=SimpleNamespace(models=SimpleNamespace(default="anthropic/old"))
+            ),
+        ),
+        patch.object(onboard.Confirm, "ask", return_value=True),
+        patch("gptme.config.core.reload_config"),
+    ):
+        onboard._create_config("openai", "openai/new")
+
+    assert load_user_config(str(config_file)).models.default == "openai/new"

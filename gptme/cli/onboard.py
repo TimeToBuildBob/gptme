@@ -13,12 +13,14 @@ from pathlib import Path
 from typing import cast
 
 import click
+import tomlkit
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from ..config import config_path, get_config, set_config_value
+from ..config.user import get_user_config_paths
 from ..llm import list_available_providers
 from ..llm.models import MODELS, PROVIDERS, BuiltinProvider, get_recommended_model
 from ..llm.validate import OAUTH_PROVIDERS, PROVIDER_DOCS, validate_api_key
@@ -265,7 +267,17 @@ def _create_config(provider: str, model: str | None = None) -> Path:
             console.print("[dim]Keeping the existing default model.[/dim]")
             return conf_path
 
-    set_config_value("models.default", model)
+    # config.local.toml overrides config.toml, so update it if it sets one.
+    _, local_path = get_user_config_paths()
+    try:
+        local_doc = tomlkit.parse(local_path.read_text(encoding="utf-8"))
+    except (OSError, tomlkit.exceptions.TOMLKitError):
+        local_doc = tomlkit.document()
+    models = local_doc.get("models")
+    in_local = isinstance(models, dict) and "default" in models
+    if in_local:
+        conf_path = local_path
+    set_config_value("models.default", model, local=in_local)
     console.print(f"\n[green]✅ Default model saved to: {conf_path}[/green]")
 
     return conf_path

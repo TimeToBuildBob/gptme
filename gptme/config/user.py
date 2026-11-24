@@ -1028,7 +1028,7 @@ def _config_write_lock(path: str | Path) -> Iterator[None]:
                 msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
 
-def _write_config_text(path: str | Path, text: str) -> None:
+def _write_config_text(path: str | Path, text: str, *, exclusive: bool = False) -> bool:
     """Replace a config file with ``text`` without ever leaving it truncated.
 
     The new contents are staged in a temporary file beside the resolved
@@ -1039,10 +1039,14 @@ def _write_config_text(path: str | Path, text: str) -> None:
 
     This replaces the destination inode: hard links to it are not updated and
     extended metadata (ACLs, xattrs) on it is not carried over.
+
+    With ``exclusive``, the file is only created if absent; returns False (and
+    writes nothing) when it already exists.
     """
     target = Path(path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
-    private = _is_private_config(target)
+    # A symlinked config.local.toml is private whatever its target is called.
+    private = _is_private_config(Path(path)) or _is_private_config(target)
     try:
         mode: int | None = stat.S_IMODE(target.stat().st_mode)
     except FileNotFoundError:
@@ -1069,7 +1073,21 @@ def _write_config_text(path: str | Path, text: str) -> None:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(staged, target)
+        if exclusive:
+            # Publish only if still absent: never replace a file another
+            # process created after our existence check.
+            try:
+                if hasattr(os, "link"):
+                    os.link(staged, target)
+                    staged.unlink()
+                else:  # pragma: no cover - rename refuses existing targets there
+                    os.rename(staged, target)
+            except FileExistsError:
+                staged.unlink()
+                return False
+        else:
+            os.replace(staged, target)
+        return True
     except BaseException:
         try:
             staged.unlink()
@@ -1098,10 +1116,10 @@ def _load_config_doc(path: str | None = None) -> tomlkit.TOMLDocument:
             else _serialize_user_config(default_config)
         )
         toml = tomlkit.dumps(initial)
-        _write_config_text(path, toml)
-        logger.info(f"Created config file at {path}")
-        doc = tomlkit.loads(toml)
-        return doc
+        if _write_config_text(path, toml, exclusive=True):
+            logger.info(f"Created config file at {path}")
+            return tomlkit.loads(toml)
+        # Another process created it after our check; read theirs instead.
     text = _read_config_text(path)
     try:
         return tomlkit.loads(text)
