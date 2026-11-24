@@ -11,7 +11,10 @@ import locale
 import logging
 import os
 import re
-from collections.abc import MutableMapping
+import stat
+import uuid
+from collections.abc import Iterator, MutableMapping
+from contextlib import contextmanager
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -22,6 +25,16 @@ from tomlkit.items import AoT
 
 if TYPE_CHECKING:
     from tomlkit.container import Container
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 from ..context.config import parse_context_budget as _parse_context_budget
 from ..util import path_with_tilde
@@ -232,32 +245,41 @@ def _strip_unknown_config_keys(path: str, keys: set[str]) -> None:
     Called after detecting unknown keys in load_user_config() so that the
     warning fires only once instead of on every future invocation.
     """
-    if not os.path.exists(path):
+    if not os.path.exists(path) or _doc_without_keys(path, keys) is None:
         return
+    try:
+        with _config_write_lock(path):
+            # Re-read under the lock so a concurrent save is not overwritten
+            # with the stale document from the unlocked check above.
+            doc = _doc_without_keys(path, keys)
+            if doc is None:
+                return
+            # May raise if the file's decoding was a guess and its original
+            # bytes cannot be preserved. Swallowing it is right *here* -- this
+            # write is only a cosmetic cleanup, so not doing it costs a repeated
+            # warning and nothing else -- but the reason is worth naming,
+            # because the same exception aborting a real save is deliberate.
+            _back_up_before_reencoding(path)
+            _write_config_doc(path, doc)
+    except OSError as e:
+        logger.warning(f"Could not strip unknown config keys from {path}: {e}")
+
+
+def _doc_without_keys(path: str, keys: set[str]) -> TOMLDocument | None:
+    """Return the config at ``path`` minus ``keys``, or None if nothing to write."""
     doc = _load_config_doc(path)
     if str(Path(path).resolve()) in _encoding_unverified or getattr(
         doc, "_providers_recovered", False
     ):
         # Cosmetic startup cleanup must not persist a guessed decoding or an
         # in-memory provider repair. Only an explicit save may rewrite it.
-        return
-    changed = False
-    for key in keys:
-        if key in doc:
-            del doc[key]
-            changed = True
-    if changed:
-        try:
-            # May raise if the file's decoding was a guess and its original bytes
-            # cannot be preserved. Swallowing it is right *here* -- this write is
-            # only a cosmetic cleanup, so not doing it costs a repeated warning
-            # and nothing else -- but the reason is worth naming, because the same
-            # exception aborting a real save is deliberate.
-            _back_up_before_reencoding(path)
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                tomlkit.dump(doc, f)
-        except OSError as e:
-            logger.warning(f"Could not strip unknown config keys from {path}: {e}")
+        return None
+    present = [key for key in keys if key in doc]
+    if not present:
+        return None
+    for key in present:
+        del doc[key]
+    return doc
 
 
 ABOUT_ACTIVITYWATCH = """ActivityWatch is a free and open-source automated time-tracker that helps you track how you spend your time on your devices."""
@@ -974,6 +996,93 @@ def _repair_providers_corruption(raw: str, path: str) -> "tomlkit.TOMLDocument |
     return doc
 
 
+def _is_private_config(path: Path) -> bool:
+    """``config.local.toml`` is where secrets (API keys) go, so keep it owner-only."""
+    return path.name == USER_CONFIG_SOURCE_LOCAL
+
+
+@contextmanager
+def _config_write_lock(path: str | Path) -> Iterator[None]:
+    """Serialize read-modify-write cycles on one config file across processes.
+
+    The lock is a sidecar next to the resolved file, so every name for the same
+    config (e.g. a dotfiles symlink) shares it. Not re-entrant: never reload the
+    config while holding it, since a reload may take it again.
+    """
+    target = Path(path).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = target.with_name(f".{target.name}.lock")
+    with lock_path.open("a+b") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+        elif msvcrt is not None:  # pragma: no cover - Windows
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            elif msvcrt is not None:  # pragma: no cover - Windows
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def _write_config_text(path: str | Path, text: str) -> None:
+    """Replace a config file with ``text`` without ever leaving it truncated.
+
+    The new contents are staged in a temporary file beside the resolved
+    destination (symlinks keep pointing at the same file) and renamed over it,
+    so a failed write leaves the previous file intact. Existing permission bits
+    are kept. ``config.local.toml`` holds secrets: it is created 0600 and an
+    existing one loses its group/other bits.
+
+    This replaces the destination inode: hard links to it are not updated and
+    extended metadata (ACLs, xattrs) on it is not carried over.
+    """
+    target = Path(path).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    private = _is_private_config(target)
+    try:
+        mode: int | None = stat.S_IMODE(target.stat().st_mode)
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and private:
+        mode &= 0o700
+    elif mode is None and private:
+        mode = 0o600
+
+    staged = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    # The secret never exists with wider permissions than its final mode: a
+    # private file is staged 0600, others get the umask-filtered 0666 default
+    # (new file) or their existing mode applied below before any rename.
+    fd = os.open(
+        staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600 if private else 0o666
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            if mode is not None:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(f.fileno(), mode)
+                else:  # pragma: no cover - Windows before 3.13
+                    os.chmod(staged, mode)
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(staged, target)
+    except BaseException:
+        try:
+            staged.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _write_config_doc(path: str | Path, doc: "TOMLDocument | Container") -> None:
+    """Serialize ``doc`` and atomically replace ``path`` (see `_write_config_text`)."""
+    _write_config_text(path, tomlkit.dumps(doc))
+
+
 def _load_config_doc(path: str | None = None) -> tomlkit.TOMLDocument:
     if path is None:
         path = config_path
@@ -989,8 +1098,7 @@ def _load_config_doc(path: str | None = None) -> tomlkit.TOMLDocument:
             else _serialize_user_config(default_config)
         )
         toml = tomlkit.dumps(initial)
-        with open(path, "w", encoding="utf-8") as config_file:
-            config_file.write(toml)
+        _write_config_text(path, toml)
         logger.info(f"Created config file at {path}")
         doc = tomlkit.loads(toml)
         return doc
@@ -1027,33 +1135,40 @@ def set_config_value(
     if local:
         _, local_path = get_user_config_paths()
         write_path = str(local_path)
-        # Load existing local config or start empty (no defaults)
-        doc: TOMLDocument | Container = (
-            _load_config_doc(write_path) if local_path.exists() else tomlkit.document()
-        )
     else:
+        local_path = None
         write_path = config_path
-        doc = _load_config_doc()
 
-    # Set the value
-    keypath = key.split(".")
-    d: TOMLDocument | Container = doc
-    for k in keypath[:-1]:
-        if k not in d:
-            d[k] = tomlkit.table()
+    # Hold the lock across read-modify-write so concurrent writers cannot drop
+    # each other's updates. Reload only after releasing it (not re-entrant).
+    with _config_write_lock(write_path):
+        if local_path is not None:
+            # Load existing local config or start empty (no defaults)
+            doc: TOMLDocument | Container = (
+                _load_config_doc(write_path)
+                if local_path.exists()
+                else tomlkit.document()
+            )
         else:
-            existing = d[k]
-            if not isinstance(existing, MutableMapping):
-                raise ValueError(f"Cannot set '{key}': '{k}' exists but is not a table")
-        d = cast("Container", d[k])
-    d[keypath[-1]] = value
+            doc = _load_config_doc()
 
-    # Write the config
-    if local:
-        os.makedirs(os.path.dirname(write_path), exist_ok=True)
-    _back_up_before_reencoding(write_path)
-    with open(write_path, "w", encoding="utf-8", newline="") as config_file:
-        tomlkit.dump(doc, config_file)
+        # Set the value
+        keypath = key.split(".")
+        d: TOMLDocument | Container = doc
+        for k in keypath[:-1]:
+            if k not in d:
+                d[k] = tomlkit.table()
+            else:
+                existing = d[k]
+                if not isinstance(existing, MutableMapping):
+                    raise ValueError(
+                        f"Cannot set '{key}': '{k}' exists but is not a table"
+                    )
+            d = cast("Container", d[k])
+        d[keypath[-1]] = value
+
+        _back_up_before_reencoding(write_path)
+        _write_config_doc(write_path, doc)
 
     if reload:
         from .core import reload_config
@@ -1079,13 +1194,33 @@ def save_provider_config(
     if local:
         _, local_path = get_user_config_paths()
         write_path = str(local_path)
-        doc: TOMLDocument | Container = (
-            _load_config_doc(write_path) if local_path.exists() else tomlkit.document()
-        )
     else:
+        local_path = None
         write_path = config_path
-        doc = _load_config_doc()
 
+    with _config_write_lock(write_path):
+        if local_path is not None:
+            doc: TOMLDocument | Container = (
+                _load_config_doc(write_path)
+                if local_path.exists()
+                else tomlkit.document()
+            )
+        else:
+            doc = _load_config_doc()
+        _add_provider_to_doc(doc, provider)
+        _back_up_before_reencoding(write_path)
+        _write_config_doc(write_path, doc)
+
+    if reload:
+        from .core import reload_config
+
+        reload_config()
+
+
+def _add_provider_to_doc(
+    doc: "TOMLDocument | Container", provider: "ProviderConfig"
+) -> None:
+    """Insert or replace the ``[[providers]]`` entry named ``provider.name``."""
     provider_table = tomlkit.table()
     provider_table.add("name", provider.name)
     provider_table.add("base_url", provider.base_url)
@@ -1115,17 +1250,6 @@ def save_provider_config(
             break
     else:
         providers.append(provider_table)
-
-    if local:
-        os.makedirs(os.path.dirname(write_path), exist_ok=True)
-    _back_up_before_reencoding(write_path)
-    with open(write_path, "w", encoding="utf-8", newline="") as config_file:
-        tomlkit.dump(doc, config_file)
-
-    if reload:
-        from .core import reload_config
-
-        reload_config()
 
 
 def _merge_config_data(
