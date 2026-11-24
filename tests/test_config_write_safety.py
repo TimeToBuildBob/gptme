@@ -274,3 +274,47 @@ def test_first_run_create_without_hard_links(tmp_path: Path, existing: bool) -> 
     expected = "theirs" if existing else "[env]"
     assert expected in path.read_text(encoding="utf-8")
     assert sorted(p.name for p in tmp_path.iterdir()) == ["config.toml"]
+
+
+@posix_only
+def test_reencoding_backup_is_never_wider_than_the_original(
+    config_file: Path,
+) -> None:
+    """The .orig backup of a legacy-encoded local config stays owner-only."""
+    local = config_file.with_name("config.local.toml")
+    original = '[env]\nKEY = "café"\n'.encode("cp1252")
+    local.write_bytes(original)
+    local.chmod(0o600)
+    load_user_config(str(config_file))  # marks the guessed decoding
+
+    old_umask = os.umask(0o022)
+    try:
+        set_config_value("models.default", "openai/new", reload=False, local=True)
+    finally:
+        os.umask(old_umask)
+
+    backup = local.with_name("config.local.toml.orig")
+    assert _mode(backup) == 0o600
+    assert backup.read_bytes() == original
+
+
+def test_first_run_create_failed_publish_leaves_no_placeholder(
+    tmp_path: Path,
+) -> None:
+    """If publishing fails without hard links, no empty config is left behind."""
+    path = tmp_path / "config.toml"
+
+    def no_links(src, dst):
+        raise PermissionError(1, "Operation not permitted")
+
+    def failing_replace(src, dst):
+        raise OSError(5, "Input/output error")
+
+    with (
+        patch.object(user_mod.os, "link", no_links),
+        patch.object(user_mod.os, "replace", failing_replace),
+        pytest.raises(OSError, match="Input/output error"),
+    ):
+        user_mod._write_config_text(path, "[env]\n", exclusive=True)
+
+    assert list(tmp_path.iterdir()) == []

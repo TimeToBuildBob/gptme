@@ -139,7 +139,20 @@ def _back_up_before_reencoding(path: str | Path) -> None:
         return
     staged = Path(f"{path}.orig.tmp")
     try:
-        staged.write_bytes(Path(path).read_bytes())
+        # The backup holds the same secrets as the original, so it never gets
+        # wider permissions than the original has (owner-only for the local file).
+        source = Path(path)
+        mode = stat.S_IMODE(source.stat().st_mode)
+        if _is_private_config(source) or _is_private_config(source.resolve()):
+            mode &= 0o700
+        staged.unlink(missing_ok=True)
+        fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            if hasattr(os, "fchmod"):
+                os.fchmod(f.fileno(), mode)
+            else:  # pragma: no cover - Windows before 3.13
+                os.chmod(staged, mode)
+            f.write(source.read_bytes())
         staged.replace(backup)
     except OSError as e:
         staged.unlink(missing_ok=True)
@@ -1090,8 +1103,26 @@ def _write_config_text(path: str | Path, text: str, *, exclusive: bool = False) 
                         # placeholder. Readers only ever see empty or complete
                         # TOML. The config lock is not re-entrant and callers
                         # may hold it, so it cannot be taken here.
-                        os.close(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL))
-                        os.replace(staged, target)
+                        os.close(
+                            os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        )
+                        placeholder = os.stat(target)
+                        try:
+                            os.replace(staged, target)
+                        except BaseException:
+                            # Never leave our empty placeholder behind: the next
+                            # launch would take it as an existing config and
+                            # skip writing the defaults.
+                            try:
+                                current = os.stat(target)
+                                if (current.st_dev, current.st_ino) == (
+                                    placeholder.st_dev,
+                                    placeholder.st_ino,
+                                ):
+                                    os.unlink(target)
+                            except FileNotFoundError:
+                                pass
+                            raise
                 else:  # pragma: no cover - rename refuses existing targets there
                     os.rename(staged, target)
             except FileExistsError:
