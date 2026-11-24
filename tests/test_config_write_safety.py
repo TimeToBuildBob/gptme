@@ -330,6 +330,7 @@ def test_first_run_cleanup_holds_the_write_lock(tmp_path: Path) -> None:
 
     path = tmp_path / "config.toml"
     other_writer_got_lock = threading.Event()
+    writers: list[threading.Thread] = []
 
     def other_writer() -> None:
         with user_mod._config_write_lock(path):
@@ -340,19 +341,27 @@ def test_first_run_cleanup_holds_the_write_lock(tmp_path: Path) -> None:
 
     def replace_fails_while_another_writer_waits(src, dst):
         writer = threading.Thread(target=other_writer)
+        writers.append(writer)
         writer.start()
         assert not other_writer_got_lock.wait(0.3)
         raise OSError(5, "Input/output error")
 
-    with (
-        patch.object(user_mod.os, "link", no_links),
-        patch.object(user_mod.os, "replace", replace_fails_while_another_writer_waits),
-        pytest.raises(OSError, match="Input/output error"),
-    ):
-        user_mod._write_config_text(path, "[env]\n", exclusive=True)
+    try:
+        with (
+            patch.object(user_mod.os, "link", no_links),
+            patch.object(
+                user_mod.os, "replace", replace_fails_while_another_writer_waits
+            ),
+            pytest.raises(OSError, match="Input/output error"),
+        ):
+            user_mod._write_config_text(path, "[env]\n", exclusive=True)
 
-    assert other_writer_got_lock.wait(5)
-    assert not path.exists()
+        assert other_writer_got_lock.wait(5)
+        assert not path.exists()
+    finally:
+        for writer in writers:
+            writer.join(5)
+    assert not any(writer.is_alive() for writer in writers)
 
 
 def test_config_write_lock_is_reentrant_in_one_thread(tmp_path: Path) -> None:
