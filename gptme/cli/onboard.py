@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast
 
 import click
+import tomlkit
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -21,6 +22,7 @@ from rich.table import Table
 from ..config import config_path, get_config, set_config_value
 from ..config.user import (
     USER_CONFIG_SOURCE_LOCAL,
+    _load_config_doc,
     get_default_model_source,
     get_user_config_paths,
 )
@@ -244,6 +246,24 @@ def _select_provider(providers: dict[str, tuple[bool, str | None]]) -> str | Non
         console.print("[red]Invalid selection. Try again.[/red]")
 
 
+def _back_up_corrupt_configs() -> None:
+    """Move unparseable user config files aside so onboarding can rewrite them.
+
+    Onboarding used to offer to overwrite an existing config. Now that it saves
+    through the shared writer, a corrupt file must be removed first or the
+    writer (and ``get_config``) would keep failing on it.
+    """
+    for path in get_user_config_paths():
+        if not path.exists():
+            continue
+        try:
+            _load_config_doc(str(path))
+        except tomlkit.exceptions.TOMLKitError:
+            backup = path.with_name(f"{path.name}.corrupt")
+            path.replace(backup)
+            console.print(f"[yellow]Moved corrupt config to: {backup}[/yellow]")
+
+
 def _create_config(provider: str, model: str | None = None) -> Path:
     """Save the chosen default model to the gptme config file.
 
@@ -263,7 +283,22 @@ def _create_config(provider: str, model: str | None = None) -> Path:
         else:
             model = provider
 
-    current = get_config().user.models.default
+    try:
+        current = get_config().user.models.default
+        in_local = get_default_model_source() == USER_CONFIG_SOURCE_LOCAL
+    except tomlkit.exceptions.TOMLKitError:
+        console.print(
+            f"\n[red]The config at {conf_path} is not valid TOML and could "
+            "not be read.[/red]"
+        )
+        if not Confirm.ask("Overwrite the corrupt config?", default=True):
+            console.print("[dim]Skipping config creation.[/dim]")
+            return conf_path
+        _back_up_corrupt_configs()
+        # Treat the config as absent so the writer creates a fresh one.
+        current = None
+        in_local = False
+
     if current and current != model:
         console.print(f"\n[yellow]Default model already set: {current}[/yellow]")
         if not Confirm.ask(f"Replace it with {model}?"):
@@ -273,7 +308,6 @@ def _create_config(provider: str, model: str | None = None) -> Path:
     # config.local.toml overrides config.toml, so update it if it sets one.
     # Use the startup loader, which also accepts legacy-encoded files.
     _, local_path = get_user_config_paths()
-    in_local = get_default_model_source() == USER_CONFIG_SOURCE_LOCAL
     if in_local:
         conf_path = local_path
     set_config_value("models.default", model, local=in_local)

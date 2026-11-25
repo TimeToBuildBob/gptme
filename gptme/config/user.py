@@ -1064,6 +1064,31 @@ def _config_write_lock(path: str | Path) -> Iterator[None]:
                 msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def _replace_with_retry(
+    src: str | Path, dst: str | Path, *, attempts: int = 5, delay: float = 0.05
+) -> None:
+    """Atomically replace ``dst`` with ``src``, retrying transient Windows locks.
+
+    On Windows, CPython opens files without ``FILE_SHARE_DELETE``, so
+    ``os.replace`` (``MoveFileEx``) fails with ``PermissionError`` while another
+    process has the destination open -- a reader, antivirus, or the search
+    indexer. The previous in-place write succeeded in that window. Retry a few
+    times before surfacing a clear error; on POSIX this is harmless.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            if attempt == attempts - 1:
+                raise OSError(
+                    f"Could not replace {dst}: it remained locked by another "
+                    f"process after {attempts} attempts"
+                ) from exc
+            # Back off a little so a short-lived reader can finish.
+            time.sleep(delay * (2**attempt))
+
+
 def _publish_over_placeholder(staged: Path, target: Path) -> None:
     """Exclusively create ``target`` from ``staged`` without hard links.
 
@@ -1075,7 +1100,7 @@ def _publish_over_placeholder(staged: Path, target: Path) -> None:
     os.close(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
     placeholder = os.stat(target)
     try:
-        os.replace(staged, target)
+        _replace_with_retry(staged, target)
     except BaseException:
         try:
             current = os.stat(target)
@@ -1163,7 +1188,7 @@ def _write_config_text(path: str | Path, text: str, *, exclusive: bool = False) 
                 staged.unlink()
                 return False
         else:
-            os.replace(staged, target)
+            _replace_with_retry(staged, target)
         return True
     except BaseException:
         try:

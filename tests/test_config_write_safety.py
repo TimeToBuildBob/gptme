@@ -11,6 +11,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -479,3 +480,147 @@ def test_windows_config_write_lock_reraises_other_errors(
     ):
         pass
     assert excinfo.value.errno == errno.EBADF
+
+
+def test_replace_retries_transient_permission_error(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Windows sharing violation (reader/AV) must not fail the save."""
+    real_replace = os.replace
+    calls = 0
+
+    def flaky_replace(src, dst):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise PermissionError(13, "Permission denied")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(user_mod.os, "replace", flaky_replace)
+    monkeypatch.setattr(user_mod.time, "sleep", lambda _s: None)
+
+    set_config_value("models.default", "openai/retried", reload=False)
+
+    assert calls == 3
+    assert load_user_config(str(config_file)).models.default == "openai/retried"
+
+
+def test_replace_raises_clear_error_after_exhausting_retries(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permanently locked config surfaces a clear error, not a bare traceback."""
+    original = config_file.read_text(encoding="utf-8")
+
+    def always_locked(src, dst):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(user_mod.os, "replace", always_locked)
+    monkeypatch.setattr(user_mod.time, "sleep", lambda _s: None)
+
+    with pytest.raises(OSError, match="remained locked by another process"):
+        set_config_value("models.default", "openai/x", reload=False)
+
+    # The old file is intact and no staging file is left behind.
+    assert config_file.read_text(encoding="utf-8") == original
+    leftovers = sorted(
+        p.name for p in config_file.parent.iterdir() if p.name.endswith(".tmp")
+    )
+    assert leftovers == []
+
+
+def test_onboard_offers_to_overwrite_corrupt_config(config_file: Path) -> None:
+    """A corrupt config must keep the overwrite recovery path, not crash."""
+    from gptme.cli import onboard
+
+    corrupt = '[models\ndefault = "broken"\n'
+    config_file.write_text(corrupt, encoding="utf-8")
+
+    with (
+        patch.object(onboard, "config_path", str(config_file)),
+        patch.object(
+            onboard,
+            "get_config",
+            side_effect=tomlkit.exceptions.TOMLKitError("corrupt"),
+        ),
+        patch.object(onboard.Confirm, "ask", return_value=True) as ask,
+        patch("gptme.config.core.reload_config"),
+    ):
+        result = onboard._create_config("openai", "openai/new")
+
+    assert result == config_file
+    ask.assert_called_once()
+    assert "Overwrite the corrupt config?" in ask.call_args.args[0]
+    backup = config_file.with_name("config.toml.corrupt")
+    assert backup.read_text(encoding="utf-8") == corrupt
+    assert load_user_config(str(config_file)).models.default == "openai/new"
+
+
+def test_onboard_declining_corrupt_overwrite_writes_nothing(
+    config_file: Path,
+) -> None:
+    from gptme.cli import onboard
+
+    corrupt = '[models\ndefault = "broken"\n'
+    config_file.write_text(corrupt, encoding="utf-8")
+
+    with (
+        patch.object(onboard, "config_path", str(config_file)),
+        patch.object(
+            onboard,
+            "get_config",
+            side_effect=tomlkit.exceptions.TOMLKitError("corrupt"),
+        ),
+        patch.object(onboard.Confirm, "ask", return_value=False),
+        patch.object(onboard, "set_config_value") as save,
+    ):
+        assert onboard._create_config("openai", "openai/new") == config_file
+
+    save.assert_not_called()
+    assert config_file.read_text(encoding="utf-8") == corrupt
+
+
+def _hold_config_lock(path: str, ready: Any, release: Any) -> None:
+    with user_mod._config_write_lock(path):
+        ready.set()
+        release.wait(30)
+
+
+def _acquire_config_lock(path: str, acquired: Any) -> None:
+    with user_mod._config_write_lock(path):
+        acquired.set()
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Windows file locking (msvcrt); spawn only exercised there",
+)
+def test_windows_spawned_writer_waits_for_the_lock(tmp_path: Path) -> None:
+    """One spawn-based writer waits while another process holds the lock.
+
+    The fake-msvcrt test and the fork-based concurrency test both skip Windows,
+    so this is the only test that exercises the real Windows lock across
+    processes. It is skipped on non-Windows hosts.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    path = str(tmp_path / "config.toml")
+    ready = ctx.Event()
+    release = ctx.Event()
+    holder = ctx.Process(target=_hold_config_lock, args=(path, ready, release))
+    holder.start()
+    waiter = None
+    try:
+        assert ready.wait(30), "lock holder did not start"
+        acquired = ctx.Event()
+        waiter = ctx.Process(target=_acquire_config_lock, args=(path, acquired))
+        waiter.start()
+        assert not acquired.wait(1.0), "second writer did not wait for the lock"
+        release.set()
+        assert acquired.wait(30), "second writer never got the lock"
+        waiter.join(30)
+        assert waiter.exitcode == 0
+    finally:
+        release.set()
+        holder.join(30)
+        if waiter is not None:
+            waiter.join(30)
+        assert holder.exitcode == 0
