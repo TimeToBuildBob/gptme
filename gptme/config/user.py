@@ -7,12 +7,14 @@ from optional config.runtime.toml defaults, config.toml, and config.local.toml.
 import codecs
 import copy
 import dataclasses
+import errno
 import locale
 import logging
 import os
 import re
 import stat
 import threading
+import time
 import uuid
 from collections.abc import Iterator, MutableMapping
 from contextlib import contextmanager
@@ -1038,9 +1040,18 @@ def _config_write_lock(path: str | Path) -> Iterator[None]:
     with lock_path.open("a+b") as lock_file:
         if fcntl is not None:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
-        elif msvcrt is not None:  # pragma: no cover - Windows
+        elif msvcrt is not None:
             lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            # LK_LOCK gives up with an error after about ten seconds, unlike
+            # flock; poll the non-blocking lock so writers really wait.
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as e:
+                    if e.errno not in (errno.EACCES, errno.EDEADLK):
+                        raise
+                time.sleep(0.05)
         held.add(str(target))
         try:
             yield
@@ -1048,7 +1059,7 @@ def _config_write_lock(path: str | Path) -> Iterator[None]:
             held.discard(str(target))
             if fcntl is not None:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
-            elif msvcrt is not None:  # pragma: no cover - Windows
+            elif msvcrt is not None:
                 lock_file.seek(0)
                 msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
@@ -1107,21 +1118,25 @@ def _write_config_text(path: str | Path, text: str, *, exclusive: bool = False) 
         mode = 0o600
 
     staged = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
-    # The secret never exists with wider permissions than its final mode: a
-    # private file is staged 0600, others get the umask-filtered 0666 default
-    # (new file) or their existing mode applied below before any rename.
+    # The contents never sit in a file more open than the destination. Another
+    # user who opens the staging file keeps that descriptor through a later
+    # chmod, so whenever the final mode is known the file is created 0600 and
+    # only gets its final mode once fully written. A new non-private file gets
+    # the umask-filtered 0666 default it ends up with anyway.
     fd = os.open(
-        staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600 if private else 0o666
+        staged,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600 if private or mode is not None else 0o666,
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
             if mode is not None:
                 if hasattr(os, "fchmod"):
                     os.fchmod(f.fileno(), mode)
                 else:  # pragma: no cover - Windows before 3.13
                     os.chmod(staged, mode)
-            f.write(text)
-            f.flush()
             os.fsync(f.fileno())
         if exclusive:
             # Publish only if still absent: never replace a file another

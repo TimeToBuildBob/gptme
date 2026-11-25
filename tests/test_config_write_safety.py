@@ -3,10 +3,12 @@
 Regression tests for gptme/gptme#5128.
 """
 
+import errno
 import multiprocessing
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -368,3 +370,112 @@ def test_config_write_lock_is_reentrant_in_one_thread(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     with user_mod._config_write_lock(path), user_mod._config_write_lock(path):
         pass
+
+
+@posix_only
+@pytest.mark.parametrize("final_mode", [0o600, 0o640, 0o644])
+def test_staging_file_is_owner_only_until_written(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, final_mode: int
+) -> None:
+    """The staged copy is never more open than 0600 while it gets the contents.
+
+    Another user who opens a wider staging file keeps that descriptor after a
+    later chmod, and would read the config (which may hold API keys) through it.
+    """
+    config_file.chmod(final_mode)
+    real_open = os.open
+    real_fchmod = os.fchmod
+    staged_fds: set[int] = set()
+    modes_at_create: list[int] = []
+    # (mode, staged size) for every chmod of the staging file
+    chmods: list[tuple[int, int]] = []
+
+    def recording_open(path, flags, mode=0o777, *args, **kwargs):
+        fd = real_open(path, flags, mode, *args, **kwargs)
+        if str(path).endswith(".tmp"):
+            staged_fds.add(fd)
+            modes_at_create.append(stat.S_IMODE(os.fstat(fd).st_mode))
+        return fd
+
+    def recording_fchmod(fd: int, mode: int) -> None:
+        if fd in staged_fds:
+            chmods.append((mode, os.fstat(fd).st_size))
+        real_fchmod(fd, mode)
+
+    monkeypatch.setattr(user_mod.os, "open", recording_open)
+    monkeypatch.setattr(user_mod.os, "fchmod", recording_fchmod)
+    old_umask = os.umask(0o022)
+    try:
+        set_config_value("env.OPENAI_API_KEY", "sk-secret", reload=False)
+    finally:
+        os.umask(old_umask)
+
+    assert modes_at_create, "staging file was not observed"
+    assert all(m & 0o077 == 0 for m in modes_at_create), [
+        oct(m) for m in modes_at_create
+    ]
+    # Group/other bits are only granted once the complete contents are in place.
+    final_size = config_file.stat().st_size
+    assert all(size == final_size for mode, size in chmods if mode & 0o077), chmods
+    assert _mode(config_file) == final_mode
+    assert "sk-secret" in config_file.read_text(encoding="utf-8")
+
+
+class _FakeMsvcrt:
+    """Models msvcrt.locking: LK_LOCK gives up after 10 one-second retries."""
+
+    LK_LOCK, LK_NBLCK, LK_UNLCK = 1, 2, 0
+
+    def __init__(self, busy_attempts: int, fail_errno: int = 13) -> None:
+        self.busy_attempts = busy_attempts
+        self.fail_errno = fail_errno
+        self.locked = False
+
+    def _try(self) -> bool:
+        if self.busy_attempts > 0:
+            self.busy_attempts -= 1
+            return False
+        self.locked = True
+        return True
+
+    def locking(self, fd: int, mode: int, nbytes: int) -> None:
+        if mode == self.LK_UNLCK:
+            self.locked = False
+        elif mode == self.LK_NBLCK:
+            if not self._try():
+                raise OSError(self.fail_errno, "Permission denied")
+        elif mode == self.LK_LOCK:
+            if not any(self._try() for _ in range(10)):
+                raise OSError(36, "Resource deadlock avoided")
+
+
+def test_windows_config_write_lock_waits_for_a_long_held_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Writers wait for the lock on Windows too, not give up after ~10s."""
+
+    fake = _FakeMsvcrt(busy_attempts=15, fail_errno=errno.EACCES)
+    monkeypatch.setattr(user_mod, "fcntl", None)
+    monkeypatch.setattr(user_mod, "msvcrt", fake)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+    with user_mod._config_write_lock(tmp_path / "config.toml"):
+        assert fake.locked
+    assert not fake.locked
+    assert fake.busy_attempts == 0
+
+
+def test_windows_config_write_lock_reraises_other_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeMsvcrt(busy_attempts=1, fail_errno=errno.EBADF)
+    monkeypatch.setattr(user_mod, "fcntl", None)
+    monkeypatch.setattr(user_mod, "msvcrt", fake)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+    with (
+        pytest.raises(OSError, match="Permission denied") as excinfo,
+        user_mod._config_write_lock(tmp_path / "config.toml"),
+    ):
+        pass
+    assert excinfo.value.errno == errno.EBADF
