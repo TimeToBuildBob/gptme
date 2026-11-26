@@ -469,7 +469,7 @@ def _line_fence_states(
 
         if depth == 1 and line.startswith("`" * fence_len):
             rest = line[fence_len:]
-            if re.match(r"^`{3,}\S", rest):
+            if re.match(r"^`{3,}[^`\s]", rest):
                 rest_match = re.match(r"^(`{3,})", rest)
                 if not rest_match:
                     states.append((1, False, outer_lang))
@@ -514,6 +514,14 @@ def _line_fence_states(
             line_fence_len = len(line_fence_match.group(1))
             is_bare_fence = line.strip() == "`" * line_fence_len
             is_outer_close = is_bare_fence and line_fence_len == fence_len
+            if (
+                is_bare_fence
+                and outer_lang in _EXEC_LANGS
+                and line_fence_len > fence_len
+            ):
+                if fence_len not in outer_closer_scans:
+                    outer_closer_scans[fence_len] = _outer_closer_scan(lines, fence_len)
+                is_outer_close = outer_closer_scans[fence_len][1][i + 1] is False
             if is_outer_close or (is_bare_fence and depth > 1):
                 if qs_single or qs_double or qs_ansi or ipy_td or ipy_ts:
                     states.append((depth, False, outer_lang))
@@ -855,7 +863,7 @@ def _outer_closer_scan(
         # Extraction splits a closer joined to the next opener ("``````shell")
         # into both: the line closes the open block, then opens a tagged one.
         rest = line[outer_fence_len:]
-        joined = bool(re.match(r"^`{3,}\S", rest))
+        joined = bool(re.match(r"^`{3,}[^`\s]", rest))
         # Extraction also accepts a closer concatenated with a reasoning tag.
         # It closes the outer block but does not open another fenced block.
         thinking_close = rest.startswith(("<think>", "<thinking>"))
@@ -1145,7 +1153,7 @@ def _extract_codeblocks(
                     # backtick run is followed by a non-whitespace char (a language tag or
                     # similar) does this match — preventing false splits on bare-backtick
                     # content lines.
-                    if re.match(r"^`{3,}\S", rest):
+                    if re.match(r"^`{3,}[^`\s]", rest):
                         yield Codeblock(
                             lang,
                             "\n".join(content_lines),
@@ -1233,9 +1241,21 @@ def _extract_codeblocks(
                     line_fence_len = len(line_fence_match.group(1))
                     # Check if this is a bare fence (only backticks on the line)
                     is_bare_fence = line.strip() == "`" * line_fence_len
-                    # For closing the outer block, need exact match of opening fence length
-                    # For inner nested blocks, any bare fence can close them
+                    # A later unmatched exact closer keeps a wider fence literal.
+                    # Without one, exec blocks accept a wider completed closer.
                     is_outer_close = is_bare_fence and line_fence_len == fence_len
+                    if (
+                        is_bare_fence
+                        and lang in _EXEC_LANGS
+                        and line_fence_len > fence_len
+                    ):
+                        if fence_len not in outer_closer_scans:
+                            outer_closer_scans[fence_len] = _outer_closer_scan(
+                                lines, fence_len
+                            )
+                        is_outer_close = (
+                            outer_closer_scans[fence_len][1][i + 1] is False
+                        )
                     if is_outer_close or (is_bare_fence and nesting_depth > 1):
                         # Bare fence - determine if opening or closing based on context
                         # A fence inside an open quoted string or a Python

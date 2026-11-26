@@ -3524,7 +3524,7 @@ def test_joined_fence_after_ambiguous_bare_fence_prefers_literal_content(
 
 
 @pytest.mark.parametrize("outer_length", [3, 4, 5])
-@pytest.mark.parametrize("trailing_length", [3, 4, 5, 6])
+@pytest.mark.parametrize("trailing_length", [3, 4, 5, 6, 7])
 @pytest.mark.parametrize("content", ["hello", "<think>\nliteral\n</think>\nhello"])
 def test_nonexec_save_ignores_distant_bare_fence_of_other_width(
     outer_length: int, trailing_length: int, content: str
@@ -3557,6 +3557,40 @@ def test_py_block_does_not_swallow_following_prose_and_output_block():
     """
     md = "```py\nx = 1\n```\nThat sets x. Output format:\n```\nx=1\n```\n"
     assert [b.content for b in Codeblock.iter_from_markdown(md)] == ["x = 1", "x=1"]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("lang", ["shell", "ipython", "py"])
+@pytest.mark.parametrize("width", [3, 4, 5, 6, 7])
+def test_wider_exec_closer_preserves_following_command(
+    width: int, lang: str, streaming: bool
+) -> None:
+    markdown = (
+        f"```{lang}\nfirst command\n"
+        + "`" * width
+        + f"\n\nNext:\n```{lang}\nsecond command\n```\n\n"
+    )
+    blocks = Codeblock.iter_from_markdown(markdown, streaming=streaming)
+    assert [(block.lang, block.content) for block in blocks] == [
+        (lang, "first command"),
+        (lang, "second command"),
+    ]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    ("lang", "content"),
+    [
+        ("shell", "cat <<'EOF'\n```````\nEOF\necho ok"),
+        ("py", "text = '''\n```````\n'''\nprint(text)"),
+    ],
+)
+def test_wider_exec_fence_in_literal_content(
+    lang: str, content: str, streaming: bool
+) -> None:
+    markdown = f"```{lang}\n{content}\n```\n\n"
+    blocks = Codeblock.iter_from_markdown(markdown, streaming=streaming)
+    assert [(block.lang, block.content) for block in blocks] == [(lang, content)]
 
 
 def test_exec_langs_cover_python_and_shell_tool_block_types():
