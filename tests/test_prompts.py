@@ -965,6 +965,55 @@ def test_prompt_workspace_accepts_full_project_approval_with_extras(
     assert "TRUSTED_CONTEXT_CMD_RAN" in content
 
 
+def test_interactive_project_approval_records_full_project_hash(tmp_path, monkeypatch):
+    """The real interactive approval path records the full project hash.
+
+    ``check_project_trust(interactive=True)`` is exactly what
+    ``approve_project_config()`` runs at startup. On approval it must persist
+    ``compute_project_hash(project)`` (shell + [env], MCP, plugins, RAG), not the
+    shell-only hash that ``check_project_shell_trust`` records. If it recorded
+    only the shell hash, a later non-interactive ``prompt_workspace()`` check
+    would lean on the legacy fallback and could drop an approved ``context_cmd``
+    (advisory finding on gptme#5368).
+    """
+    import sys
+
+    from gptme.config import trust as trust_mod
+    from gptme.config.project import get_project_config
+    from gptme.config.trust import (
+        _is_approved,
+        check_project_trust,
+        compute_project_hash,
+        compute_shell_hash,
+    )
+
+    monkeypatch.delenv("GPTME_TRUST_PROJECT_SHELL", raising=False)
+    monkeypatch.setattr(trust_mod, "_launcher_trusts_all", False)
+    trust_mod._session_decisions.clear()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(trust_mod, "_prompt_user", lambda *a, **k: True)
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    cmd = "echo TRUSTED_CONTEXT_CMD_RAN"
+    (workspace / "gptme.toml").write_text(
+        f'[prompt]\ncontext_cmd = "{cmd}"\n\n[env]\nFOO = "bar"\n'
+    )
+    project = get_project_config(workspace)
+    assert project is not None
+
+    assert check_project_trust(project, workspace, interactive=True) is True
+
+    # Drop the in-memory decision so the assertions read the persisted store,
+    # exactly like a later process would.
+    trust_mod._session_decisions.clear()
+    full_hash = compute_project_hash(project)
+    assert _is_approved(full_hash, workspace)
+    assert full_hash != compute_shell_hash(cmd, [])
+    assert not _is_approved(compute_shell_hash(cmd, []), workspace)
+
+
 def test_prompt_workspace_path_included_without_runtime_context(tmp_path):
     """Path must appear when include_path=True regardless of include_runtime_context."""
     from gptme.prompts import prompt_workspace
